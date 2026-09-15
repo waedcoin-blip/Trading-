@@ -98,7 +98,43 @@ export default function App() {
       try {
         const payload = JSON.parse(event.data);
         if (payload.type === 'STATE_UPDATE') {
-          setState(payload.data);
+          const incomingData = payload.data;
+          if (incomingData) {
+            setState(prevState => {
+              if (!prevState || !prevState.positions) return incomingData;
+              const mergedPositions = (incomingData.positions || []).map((fetchedPos: any) => {
+                const currentPos = prevState.positions.find(p => p.id === fetchedPos.id);
+                if (
+                  currentPos &&
+                  currentPos.priceUpdatedAt &&
+                  (!fetchedPos.priceUpdatedAt || currentPos.priceUpdatedAt > fetchedPos.priceUpdatedAt)
+                ) {
+                  return {
+                    ...fetchedPos,
+                    current_price: currentPos.current_price,
+                    currentPrice: currentPos.currentPrice,
+                    current_value_sol: currentPos.current_value_sol,
+                    currentValue: currentPos.currentValue,
+                    unrealized_pnl_sol: currentPos.unrealized_pnl_sol,
+                    unrealizedPnl: currentPos.unrealizedPnl,
+                    unrealized_pnl_percent: currentPos.unrealized_pnl_percent,
+                    unrealizedPnlPercent: currentPos.unrealizedPnlPercent,
+                    priceUpdatedAt: currentPos.priceUpdatedAt,
+                    priceSource: (currentPos as any).priceSource,
+                    isStale: (currentPos as any).isStale,
+                    peak_pnl_percent: currentPos.peak_pnl_percent,
+                    peak_price: currentPos.peak_price,
+                    trailing_stop_armed: currentPos.trailing_stop_armed
+                  };
+                }
+                return fetchedPos;
+              });
+              return {
+                ...incomingData,
+                positions: mergedPositions
+              };
+            });
+          }
         } else if (payload.type === 'POSITION_PNL_UPDATE') {
           const { positionId, mint, pnlSol, pnlPercent, currentValueSol, currentPriceSol, currentPriceUsd, solUsdRate, priceUpdatedAt, priceSource, isStale } = payload.data;
           

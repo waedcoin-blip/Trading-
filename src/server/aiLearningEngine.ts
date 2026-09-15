@@ -89,14 +89,14 @@ class AILearningEngineService {
       realizedPnLPercent: trade.pnl_percent,
       holdingDuration,
 
-      aiScoreAtEntry: position?.take_profit_percent ? 75 : 50,
-      aiConfidenceAtEntry: 65,
+      aiScoreAtEntry: position?.ai_score_at_entry ?? 50,
+      aiConfidenceAtEntry: position?.ai_confidence_at_entry ?? 65,
 
-      marketCapAtEntry: 'UNKNOWN',
-      liquidityAtEntry: 'UNKNOWN',
-      volumeAtEntry: 'UNKNOWN',
+      marketCapAtEntry: position?.market_cap_at_entry ?? 'UNKNOWN',
+      liquidityAtEntry: position?.liquidity_at_entry ?? 'UNKNOWN',
+      volumeAtEntry: position?.volume_24h_at_entry ?? 'UNKNOWN',
 
-      buyerVelocity: 'UNKNOWN',
+      buyerVelocity: position?.buyers_10s_at_entry ?? 'UNKNOWN',
       sellerVelocity: 'UNKNOWN',
 
       tokenAge: 'UNKNOWN',

@@ -1,6 +1,0 @@
-{
-  "name": "Ultra Trading Bot",
-  "description": "A production-grade Solana trader-wallet monitoring and copy-trading terminal.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

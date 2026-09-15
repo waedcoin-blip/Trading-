@@ -38,6 +38,14 @@ export default function TradingPage({ state, sendAction }: TradingPageProps) {
   const [tradeAmount, setTradeAmount] = useState(settings.trading_amount_sol.toString());
   const [tp, setTp] = useState(settings.take_profit_percent.toString());
   const [sl, setSl] = useState(settings.stop_loss_percent.toString());
+  const [minAiScore, setMinAiScore] = useState((settings.min_ai_score_to_buy ?? 55).toString());
+  const [enableTrailing, setEnableTrailing] = useState(settings.enable_trailing_stop ?? true);
+  const [trailingActivation, setTrailingActivation] = useState((settings.trailing_stop_activation_percent ?? 15).toString());
+  const [trailingDist, setTrailingDist] = useState((settings.trailing_stop_percent ?? 10).toString());
+  const [enableTimeExit, setEnableTimeExit] = useState(settings.enable_time_exit ?? true);
+  const [maxHoldMins, setMaxHoldMins] = useState((settings.max_hold_minutes ?? 30).toString());
+  const [stagnantThresh, setStagnantThresh] = useState((settings.stagnant_pnl_threshold_percent ?? 5).toString());
+
   const [showConfirmMainnet, setShowConfirmMainnet] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
@@ -81,7 +89,14 @@ export default function TradingPage({ state, sendAction }: TradingPageProps) {
     sendAction('UPDATE_SETTINGS', {
       trading_amount_sol: amountVal,
       take_profit_percent: tpVal,
-      stop_loss_percent: slVal
+      stop_loss_percent: slVal,
+      min_ai_score_to_buy: parseFloat(minAiScore) || 55,
+      enable_trailing_stop: enableTrailing,
+      trailing_stop_activation_percent: parseFloat(trailingActivation) || 15,
+      trailing_stop_percent: parseFloat(trailingDist) || 10,
+      enable_time_exit: enableTimeExit,
+      max_hold_minutes: parseFloat(maxHoldMins) || 30,
+      stagnant_pnl_threshold_percent: parseFloat(stagnantThresh) || 5
     });
   };
 
@@ -288,7 +303,7 @@ export default function TradingPage({ state, sendAction }: TradingPageProps) {
           </div>
 
           <form onSubmit={handleUpdateConfig} className="space-y-4">
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="col-span-1">
                 <label className="block text-[10px] font-medium text-[#9ca3af] mb-1">Buy Amount</label>
                 <div className="relative">
@@ -326,6 +341,90 @@ export default function TradingPage({ state, sendAction }: TradingPageProps) {
                   />
                   <span className="absolute right-2 top-2.5 text-[9px] text-[#4b5563] font-bold">%</span>
                 </div>
+              </div>
+
+              <div className="col-span-1">
+                <label className="block text-[10px] font-medium text-[#9ca3af] mb-1">Min AI Score Gate</label>
+                <div className="relative">
+                  <input 
+                    type="text" 
+                    value={minAiScore}
+                    onChange={(e) => setMinAiScore(e.target.value)}
+                    className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-2.5 py-2 text-xs text-[#f3f4f6] focus:outline-none focus:border-[#3b82f6] font-mono"
+                  />
+                  <span className="absolute right-2 top-2.5 text-[9px] text-[#4b5563] font-bold">/99</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Trailing Stop & Time Exit Settings */}
+            <div className="border-t border-[#1e2533] pt-3 grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+              <div className="space-y-2 bg-[#0b0e14] p-2.5 rounded border border-[#1e2533]">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-[11px] text-[#f3f4f6]">Trailing Stop Loss</span>
+                  <input 
+                    type="checkbox" 
+                    checked={enableTrailing} 
+                    onChange={(e) => setEnableTrailing(e.target.checked)}
+                    className="rounded border-[#1e2533] bg-[#12161f]"
+                  />
+                </div>
+                {enableTrailing && (
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    <div>
+                      <label className="block text-[#6b7280]">Activate at +PnL</label>
+                      <input 
+                        type="text" 
+                        value={trailingActivation} 
+                        onChange={(e) => setTrailingActivation(e.target.value)}
+                        className="w-full bg-[#12161f] border border-[#1e2533] rounded px-2 py-1 text-xs text-[#f3f4f6] font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6b7280]">Trailing Dist %</label>
+                      <input 
+                        type="text" 
+                        value={trailingDist} 
+                        onChange={(e) => setTrailingDist(e.target.value)}
+                        className="w-full bg-[#12161f] border border-[#1e2533] rounded px-2 py-1 text-xs text-[#f3f4f6] font-mono"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-2 bg-[#0b0e14] p-2.5 rounded border border-[#1e2533]">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-[11px] text-[#f3f4f6]">Time / Stagnation Exit</span>
+                  <input 
+                    type="checkbox" 
+                    checked={enableTimeExit} 
+                    onChange={(e) => setEnableTimeExit(e.target.checked)}
+                    className="rounded border-[#1e2533] bg-[#12161f]"
+                  />
+                </div>
+                {enableTimeExit && (
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    <div>
+                      <label className="block text-[#6b7280]">Max Hold (Mins)</label>
+                      <input 
+                        type="text" 
+                        value={maxHoldMins} 
+                        onChange={(e) => setMaxHoldMins(e.target.value)}
+                        className="w-full bg-[#12161f] border border-[#1e2533] rounded px-2 py-1 text-xs text-[#f3f4f6] font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6b7280]">Stagnant PnL &lt; %</label>
+                      <input 
+                        type="text" 
+                        value={stagnantThresh} 
+                        onChange={(e) => setStagnantThresh(e.target.value)}
+                        className="w-full bg-[#12161f] border border-[#1e2533] rounded px-2 py-1 text-xs text-[#f3f4f6] font-mono"
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 

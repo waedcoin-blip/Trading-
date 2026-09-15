@@ -42,6 +42,17 @@ const DEFAULT_SETTINGS: Settings = {
   trading_mode: 'PAPER',
   mainnet_enabled: false,
 
+  // AI score threshold
+  min_ai_score_to_buy: 55,
+
+  // Trailing stop & Time/stagnation exit defaults
+  enable_trailing_stop: true,
+  trailing_stop_activation_percent: 15,
+  trailing_stop_percent: 10,
+  enable_time_exit: true,
+  max_hold_minutes: 30,
+  stagnant_pnl_threshold_percent: 5,
+
   // RugCheck defaults
   enableRugCheck: true,
   requiredRugStatus: ['Good', 'Warn'],
@@ -69,10 +80,22 @@ const INITIAL_DB: DatabaseSchema = {
 export class Database {
   private cache: DatabaseSchema | null = null;
   private dbPath: string;
+  private saveTimer: NodeJS.Timeout | null = null;
+  private pendingWrite = false;
+  private static readonly DEBOUNCE_MS = 1500;
 
   constructor(customPath: string = DB_PATH) {
     this.dbPath = customPath;
     this.init();
+
+    const flushOnExit = () => {
+      if (this.pendingWrite && this.cache) {
+        this.save(true);
+      }
+    };
+    process.on('beforeExit', flushOnExit);
+    process.on('SIGINT', flushOnExit);
+    process.on('SIGTERM', flushOnExit);
   }
 
   private init() {
@@ -261,9 +284,27 @@ export class Database {
     }
   }
 
-  private save() {
-    if (this.cache) {
-      this.write(this.cache);
+  private save(immediate: boolean = true) {
+    if (immediate) {
+      if (this.saveTimer) {
+        clearTimeout(this.saveTimer);
+        this.saveTimer = null;
+      }
+      this.pendingWrite = false;
+      if (this.cache) {
+        this.write(this.cache);
+      }
+    } else {
+      this.pendingWrite = true;
+      if (!this.saveTimer) {
+        this.saveTimer = setTimeout(() => {
+          this.saveTimer = null;
+          if (this.pendingWrite && this.cache) {
+            this.pendingWrite = false;
+            this.write(this.cache);
+          }
+        }, Database.DEBOUNCE_MS);
+      }
     }
   }
 
@@ -432,7 +473,7 @@ export class Database {
       ...partial,
       updated_at: new Date().toISOString()
     };
-    this.save();
+    this.save(false);
     return { ...current.positions[idx] };
   }
 

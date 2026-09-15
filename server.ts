@@ -721,16 +721,13 @@ async function evaluateAndCopyToken(
       console.warn(`[RugCheck] REJECTED: Token ${tokenSymbol} (${mint}) failed security validation. Reason: ${rejectionReason}`);
     } else {
       rugCheckPassed = true;
-      console.log(`[RugCheck] PASSED: Token ${tokenSymbol} (${mint}) verified safe. Risk Level: ${rugCheck.riskLevel}, LP Locked: ${rugCheck.lpLocked}, Mint Auth: ${rugCheck.mintAuthority === null ? 'Revoked' : 'Active'}, Freeze Auth: ${rugCheck.freezeAuthority === null ? 'Revoked' : 'Active'}`);
+      console.log(`[RugCheck] PASSED: Token ${tokenSymbol} (${mint}) verified safe. Risk Level: ${rugCheck.riskLevel}`);
     }
   }
 
-  const isEligible = rejectionReason === '';
-  const status = isEligible ? 'ELIGIBLE' : 'REJECT';
-
-  // Calculate AI Score using Gemini AI learning engine (ONLY IF token passed all prior security checks)
-  let aiResult = { score: 50, signals: { positive: [], risks: [] } };
-  if (isEligible) {
+  // AI scoring gate: runs AFTER base filters & RugCheck pass, BEFORE final eligibility decision
+  let aiResult: { score: number; confidence?: number; signals: { positive: string[]; risks: string[] } } | null = null;
+  if (!rejectionReason) {
     const previousTrades = db.getTrades();
     aiResult = await scoreToken({
       token_mint: mint,
@@ -742,13 +739,21 @@ async function evaluateAndCopyToken(
       developer_holding_percent: developerHoldingPercent,
       buyers_10s: buyers10s,
       price: price,
-      status: status
+      status: 'WAIT'
     }, previousTrades);
+
+    const minScore = settings.min_ai_score_to_buy ?? 55;
+    if (aiResult.score < minScore) {
+      rejectionReason = `AI Score (${aiResult.score}) below minimum entry threshold (${minScore})`;
+    }
   }
 
-  console.log(`[Filters] Evaluation completed for ${tokenSymbol} (${mint}). Status: ${status}.${isEligible ? ` AI Score: ${aiResult.score}` : ` Reason: ${rejectionReason}`}`);
+  const isEligible = rejectionReason === '';
+  const status = isEligible ? 'ELIGIBLE' : 'REJECT';
 
-  // Persist observation
+  console.log(`[Filters] Evaluation completed for ${tokenSymbol} (${mint}). Status: ${status}.${aiResult ? ` AI Score: ${aiResult.score}` : ''}${rejectionReason ? ` Reason: ${rejectionReason}` : ''}`);
+
+  // Persist observation (store ai_score/ai_signals whenever scoring ran)
   db.addTokenObservation({
     token_mint: mint,
     token_name: tokenName,
@@ -762,14 +767,14 @@ async function evaluateAndCopyToken(
     status,
     rejection_reason: rejectionReason || undefined,
     source_trader_name: trader.name,
-    ai_score: isEligible ? aiResult.score : undefined,
-    ai_signals: isEligible ? aiResult.signals : undefined,
+    ai_score: aiResult ? aiResult.score : undefined,
+    ai_signals: aiResult ? aiResult.signals : undefined,
     rugcheck: rugCheck,
     rugcheck_passed: rugCheck ? rugCheckPassed : undefined
   });
 
-  // If eligible, execute trade entry in background!
-  if (isEligible) {
+  // If eligible, execute trade entry in background
+  if (isEligible && aiResult) {
     if (settings.trading_mode === 'PAPER') {
       await executePaperBuy({
         mint,
@@ -779,6 +784,12 @@ async function evaluateAndCopyToken(
         trader,
         buySignature: buyDetails.signature,
         aiScore: aiResult.score,
+        aiConfidence: aiResult.confidence ?? 65,
+        aiSignals: aiResult.signals,
+        marketCap,
+        liquidity,
+        volume24h,
+        buyers10s,
         priceUsd: price,
         rugcheck: rugCheck
       });
@@ -816,6 +827,12 @@ async function executePaperBuy(params: {
   trader: TraderWallet;
   buySignature: string;
   aiScore: number;
+  aiConfidence?: number;
+  aiSignals?: { positive: string[]; risks: string[] };
+  marketCap?: number | 'UNKNOWN';
+  liquidity?: number | 'UNKNOWN';
+  volume24h?: number | 'UNKNOWN';
+  buyers10s?: number | 'UNKNOWN';
   priceUsd: number;
   rugcheck?: any;
 }) {
@@ -935,7 +952,21 @@ async function executePaperBuy(params: {
     status: 'ACTIVE',
     take_profit_percent: settings.take_profit_percent,
     stop_loss_percent: settings.stop_loss_percent,
-    rugcheck: activeRugCheck
+    rugcheck: activeRugCheck,
+
+    // Trailing stop tracking
+    peak_pnl_percent: 0,
+    peak_price: entryPriceSol,
+    trailing_stop_armed: false,
+
+    // Entry snapshot for AI learning
+    ai_score_at_entry: params.aiScore,
+    ai_confidence_at_entry: params.aiConfidence ?? 65,
+    ai_signals_at_entry: params.aiSignals,
+    market_cap_at_entry: params.marketCap ?? 'UNKNOWN',
+    liquidity_at_entry: params.liquidity ?? 'UNKNOWN',
+    volume_24h_at_entry: params.volume24h ?? 'UNKNOWN',
+    buyers_10s_at_entry: params.buyers10s ?? 'UNKNOWN'
   });
 
   // Record BUY in RebuyGuard
@@ -962,6 +993,7 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
   if (activePositions.length === 0) return;
 
   const solUsdRate = livePriceService.getSolUsdPrice();
+  const settings = db.getSettings();
 
   for (const pos of activePositions) {
     if (exitingPositions.has(pos.id)) continue;
@@ -974,6 +1006,17 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
     const currentPriceUsdFormatted = `$${livePrice.priceUsd < 0.01 ? livePrice.priceUsd.toFixed(8) : livePrice.priceUsd.toFixed(4)}`;
     const currentValueUsdFormatted = `$${(currentValueSol * solUsdRate).toFixed(2)}`;
 
+    // Calculate peak PnL, peak price, and trailing stop armed status
+    const currentPeakPnl = Math.max(pos.peak_pnl_percent ?? 0, pnlPercent);
+    const currentPeakPrice = Math.max(pos.peak_price ?? pos.entry_price, livePrice.priceSol);
+
+    const trailingStopActivation = settings.trailing_stop_activation_percent ?? 15;
+    const trailingStopDist = settings.trailing_stop_percent ?? 10;
+    const isTrailingArmed = Boolean(
+      pos.trailing_stop_armed ||
+      (settings.enable_trailing_stop && currentPeakPnl >= trailingStopActivation)
+    );
+
     // Update active position metrics in DB
     db.updatePosition(pos.id, {
       current_price: livePrice.priceSol,
@@ -983,7 +1026,10 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
       unrealized_pnl_sol: pnlSol,
       unrealizedPnl: `${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
       unrealized_pnl_percent: pnlPercent,
-      unrealizedPnlPercent: `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`
+      unrealizedPnlPercent: `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`,
+      peak_pnl_percent: currentPeakPnl,
+      peak_price: currentPeakPrice,
+      trailing_stop_armed: isTrailingArmed
     });
 
     // Broadcast targeted POSITION_PNL_UPDATE for instant UI update
@@ -1010,13 +1056,34 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
       }
     }
 
-    // Evaluate Take Profit / Stop Loss triggers (Skip if price is stale)
+    // Evaluate Take Profit / Stop Loss / Trailing Stop / Stagnant Exit triggers (Skip if price is stale)
     if (!livePrice.isStale) {
-      let triggerReason: 'TAKE_PROFIT' | 'STOP_LOSS' | null = null;
+      let triggerReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | null = null;
+
+      // 1. Take Profit
       if (pnlPercent >= pos.take_profit_percent) {
         triggerReason = 'TAKE_PROFIT';
-      } else if (pnlPercent <= -pos.stop_loss_percent) {
+      }
+      // 2. Stop Loss
+      else if (pnlPercent <= -pos.stop_loss_percent) {
         triggerReason = 'STOP_LOSS';
+      }
+      // 3. Trailing Stop
+      else if (
+        settings.enable_trailing_stop &&
+        isTrailingArmed &&
+        (currentPeakPnl - pnlPercent) >= trailingStopDist
+      ) {
+        triggerReason = 'TRAILING_STOP';
+      }
+      // 4. Time / Stagnant Exit
+      else if (settings.enable_time_exit) {
+        const holdDurationMs = Date.now() - new Date(pos.buy_time).getTime();
+        const maxHoldMs = (settings.max_hold_minutes ?? 30) * 60 * 1000;
+        const stagnantThresh = settings.stagnant_pnl_threshold_percent ?? 5;
+        if (holdDurationMs >= maxHoldMs && Math.abs(pnlPercent) < stagnantThresh) {
+          triggerReason = 'STAGNANT';
+        }
       }
 
       if (triggerReason) {
@@ -1026,7 +1093,7 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
           .finally(() => exitingPositions.delete(pos.id));
       }
     } else {
-      console.warn(`[Exit Engine] Price for ${pos.token_symbol} is STALE (${Date.now() - livePrice.updatedAt}ms). Automatic TP/SL execution skipped.`);
+      console.warn(`[Exit Engine] Price for ${pos.token_symbol} is STALE (${Date.now() - livePrice.updatedAt}ms). Automatic exit execution skipped.`);
     }
   }
 }
@@ -1178,7 +1245,7 @@ async function executePositionExit(
   solOut: number, 
   pnlSol: number, 
   pnlPercent: number, 
-  reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL' | 'ERROR_RECOVERY'
+  reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | 'MANUAL' | 'ERROR_RECOVERY'
 ) {
   console.log(`[Exit Engine] TRIGGERED: Selling 100% of ${pos.token_symbol} (${pos.token_mint}). Reason: ${reason}. PnL: ${pnlPercent}%`);
 

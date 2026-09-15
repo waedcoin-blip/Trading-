@@ -19,6 +19,17 @@ export interface Settings {
   trading_mode: 'PAPER' | 'MAINNET';
   mainnet_enabled: boolean;
 
+  // AI score threshold
+  min_ai_score_to_buy: number;
+
+  // Trailing stop & Time/stagnation exit settings
+  enable_trailing_stop: boolean;
+  trailing_stop_activation_percent: number;
+  trailing_stop_percent: number;
+  enable_time_exit: boolean;
+  max_hold_minutes: number;
+  stagnant_pnl_threshold_percent: number;
+
   // RugCheck Security Filter settings
   enableRugCheck: boolean;
   requiredRugStatus: string[];
@@ -174,6 +185,20 @@ export interface Position extends ActivePosition {
   priceUpdatedAt?: number;
   priceSource?: 'jupiter' | 'fallback';
   isStale?: boolean;
+
+  // Trailing stop tracking
+  peak_pnl_percent?: number;
+  peak_price?: number;
+  trailing_stop_armed?: boolean;
+
+  // Entry snapshot for AI learning
+  ai_score_at_entry?: number;
+  ai_confidence_at_entry?: number;
+  ai_signals_at_entry?: { positive: string[]; risks: string[] };
+  market_cap_at_entry?: number | 'UNKNOWN';
+  liquidity_at_entry?: number | 'UNKNOWN';
+  volume_24h_at_entry?: number | 'UNKNOWN';
+  buyers_10s_at_entry?: number | 'UNKNOWN';
 }
 
 export interface Trade {
@@ -200,7 +225,7 @@ export interface Trade {
   sell_time: string;
   pnl_sol: number;
   pnl_percent: number;
-  sell_reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL' | 'PARTIAL' | 'ERROR_RECOVERY';
+  sell_reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | 'MANUAL' | 'PARTIAL' | 'ERROR_RECOVERY';
   mode: 'PAPER' | 'MAINNET';
   tradeNumber?: number;
   isRebuy?: boolean;
