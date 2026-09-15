@@ -1,4 +1,4 @@
-import { db } from '../db.js';
+import { jupiterService, JupiterV3PriceItem } from './jupiterService.js';
 
 export interface LivePrice {
   mint: string;
@@ -43,36 +43,20 @@ class LivePriceService {
   
   // Stale threshold: 15 seconds
   private readonly STALE_THRESHOLD_MS = 15000;
-  // Fallback stale threshold: 60 seconds
-  private readonly CRITICAL_STALE_THRESHOLD_MS = 60000;
-
-  private jupiterStatus: 'CONNECTED' | 'INVALID_API_KEY' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED' = 'NOT_CONFIGURED';
 
   constructor() {
     this.refreshSolPrice();
   }
 
   /**
-   * Retrieves the active Jupiter API key securely from environment or settings
+   * Retrieves the active Jupiter API key strictly from environment.
    */
   public getJupiterApiKey(): string {
-    const envKey = process.env.JUPITER_API_KEY;
-    if (envKey && envKey.trim().length > 0) {
-      return envKey.trim();
-    }
-    const settings = db.getSettings();
-    if (settings?.jupiter_api_key && settings.jupiter_api_key.trim().length > 0) {
-      return settings.jupiter_api_key.trim();
-    }
-    return '';
+    return jupiterService.getApiKey();
   }
 
-  public getJupiterStatus(): 'CONNECTED' | 'INVALID_API_KEY' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED' {
-    const key = this.getJupiterApiKey();
-    if (!key) {
-      return 'NOT_CONFIGURED';
-    }
-    return this.jupiterStatus;
+  public getJupiterStatus(): 'CONNECTED' | 'INVALID_API_KEY' | 'RATE_LIMITED' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED' {
+    return jupiterService.getStatus();
   }
 
   /**
@@ -106,7 +90,6 @@ class LivePriceService {
     }
     this.listeners.get(mint)!.add(listener);
 
-    // If we have an existing fresh price, notify immediately
     const existing = this.getLivePrice(mint);
     if (existing) {
       listener(existing);
@@ -142,35 +125,20 @@ class LivePriceService {
    * Refresh authoritative SOL/USD price
    */
   public async refreshSolPrice(): Promise<number> {
+    const solMint = 'So11111111111111111111111111111111111111112';
     try {
-      const apiKey = this.getJupiterApiKey();
-      const headers: Record<string, string> = {
-        'Accept': 'application/json'
-      };
-      if (apiKey) {
-        headers['x-api-key'] = apiKey;
+      // 1. Try Jupiter V3 API first
+      const jupPrices = await jupiterService.getPrices([solMint]);
+      const solData = jupPrices.get(solMint);
+      if (solData && solData.usdPrice && solData.usdPrice > 0) {
+        this.solUsdPrice = solData.usdPrice;
+        this.lastSolPriceUpdate = Date.now();
+        return this.solUsdPrice;
       }
 
-      // Try Jupiter price API first for SOL
-      const solMint = 'So11111111111111111111111111111111111111112';
-      const jupRes = await fetch(`https://api.jup.ag/price/v2?ids=${solMint}`, {
-        headers,
-        signal: AbortSignal.timeout(3500)
-      });
-
-      if (jupRes.ok) {
-        const jupData = await jupRes.json();
-        const solData = jupData?.data?.[solMint];
-        if (solData?.price) {
-          this.solUsdPrice = Number(solData.price);
-          this.lastSolPriceUpdate = Date.now();
-          return this.solUsdPrice;
-        }
-      }
-
-      // Fallback to DexScreener for SOL
+      // 2. Fallback to DexScreener for SOL
       const dexRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${solMint}`, {
-        signal: AbortSignal.timeout(4000)
+        signal: AbortSignal.timeout(3500)
       });
       if (dexRes.ok) {
         const dexData = await dexRes.json();
@@ -188,84 +156,66 @@ class LivePriceService {
   }
 
   /**
-   * Fetch live prices for multiple mints simultaneously via Jupiter Batch Pricing API
-   * with automatic fallback for any missing or failed tokens.
+   * Fetch live prices for multiple mints simultaneously via Jupiter V3 Batch Pricing API
+   * with automatic DexScreener fallback for any missing or failed tokens.
    */
   public async fetchPrices(mints: string[]): Promise<Map<string, LivePrice>> {
     const results = new Map<string, LivePrice>();
-    if (mints.length === 0) return results;
+    if (!mints || mints.length === 0) return results;
 
-    const uniqueMints = Array.from(new Set(mints.filter(Boolean)));
-    const apiKey = this.getJupiterApiKey();
-    const headers: Record<string, string> = {
-      'Accept': 'application/json'
-    };
-    if (apiKey) {
-      headers['x-api-key'] = apiKey;
+    const solMint = 'So11111111111111111111111111111111111111112';
+    const uniqueMints = Array.from(new Set(mints.filter(m => Boolean(m) && typeof m === 'string')));
+    if (uniqueMints.length === 0) return results;
+
+    // Combine SOL mint with requested mints for single efficient Jupiter V3 batch query
+    const allQueryMints = Array.from(new Set([solMint, ...uniqueMints]));
+
+    // 1. PRIMARY: Query Jupiter Price API V3 for all mints in a single batch call
+    let jupPrices = new Map<string, JupiterV3PriceItem>();
+    try {
+      jupPrices = await jupiterService.getPrices(allQueryMints);
+    } catch (err) {
+      console.warn('[LivePriceService] Jupiter V3 batch fetch error:', err);
     }
 
-    const missingMints: string[] = [];
-
-    // Ensure SOL/USD rate is fresh
-    if (Date.now() - this.lastSolPriceUpdate > 30000) {
+    // Check if SOL price returned from Jupiter
+    const solData = jupPrices.get(solMint);
+    if (solData && solData.usdPrice && solData.usdPrice > 0) {
+      this.solUsdPrice = solData.usdPrice;
+      this.lastSolPriceUpdate = Date.now();
+    } else if (Date.now() - this.lastSolPriceUpdate > 30000) {
       await this.refreshSolPrice();
     }
+
     const currentSolUsd = this.getSolUsdPrice();
+    const missingMints: string[] = [];
 
-    // 1. PRIMARY: Query Jupiter Price API v2 with all mints in a single concurrent batch
-    try {
-      const idsParam = encodeURIComponent(uniqueMints.join(','));
-      const url = `https://api.jup.ag/price/v2?ids=${idsParam}&showExtraInfo=true`;
-      
-      const response = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(3000)
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const tokenMap = data?.data || {};
-
-        this.jupiterStatus = apiKey ? 'CONNECTED' : 'NOT_CONFIGURED';
-
-        for (const mint of uniqueMints) {
-          const item = tokenMap[mint];
-          if (item && item.price !== undefined && item.price !== null) {
-            const priceUsd = Number(item.price);
-            const priceSol = Number((priceUsd / currentSolUsd).toFixed(12));
-            const livePrice: LivePrice = {
-              mint,
-              priceSol,
-              priceUsd,
-              source: 'jupiter',
-              updatedAt: Date.now(),
-              isStale: false,
-              extra: {
-                confidenceLevel: item.extraInfo?.confidenceLevel,
-                depth: item.extraInfo?.depth
-              }
-            };
-            results.set(mint, livePrice);
-            this.updateCacheAndNotify(livePrice);
-          } else {
-            missingMints.push(mint);
+    // Process Jupiter results for requested mints
+    for (const mint of uniqueMints) {
+      const item = jupPrices.get(mint);
+      if (item && item.usdPrice && item.usdPrice > 0) {
+        const priceUsd = item.usdPrice;
+        const priceSol = Number((priceUsd / currentSolUsd).toFixed(12));
+        const livePrice: LivePrice = {
+          mint,
+          priceSol,
+          priceUsd,
+          source: 'jupiter',
+          updatedAt: Date.now(),
+          isStale: false,
+          extra: {
+            depth: item.liquidity,
+            confidenceLevel: item.blockId ? `Block #${item.blockId}` : undefined
           }
-        }
+        };
+        results.set(mint, livePrice);
+        this.updateCacheAndNotify(livePrice);
       } else {
-        if (response.status === 401 || response.status === 403) {
-          this.jupiterStatus = 'INVALID_API_KEY';
-        } else {
-          this.jupiterStatus = 'CONNECTION_ERROR';
-        }
-        // All mints fall back
-        missingMints.push(...uniqueMints);
+        missingMints.push(mint);
       }
-    } catch (err: any) {
-      this.jupiterStatus = apiKey ? 'CONNECTION_ERROR' : 'NOT_CONFIGURED';
-      missingMints.push(...uniqueMints);
     }
 
-    // 2. FALLBACK: Fetch missing mints via DexScreener concurrently (bounded)
+    // 2. FALLBACK: Fetch missing mints via DexScreener concurrently
     if (missingMints.length > 0) {
       await Promise.allSettled(
         missingMints.map(async (mint) => {
@@ -290,20 +240,23 @@ class LivePriceService {
                 };
                 results.set(mint, livePrice);
                 this.updateCacheAndNotify(livePrice);
+                return;
               }
             }
           } catch (err: any) {
-            // Check if we have stale cached price
-            const cached = this.cache.get(mint);
-            if (cached) {
-              const stalePrice: LivePrice = {
-                ...cached,
-                isStale: true,
-                extra: { lastError: err?.message || 'Price refresh failed' }
-              };
-              results.set(mint, stalePrice);
-              this.updateCacheAndNotify(stalePrice);
-            }
+            // DexScreener error
+          }
+
+          // Check if we have stale cached price
+          const cached = this.cache.get(mint);
+          if (cached) {
+            const stalePrice: LivePrice = {
+              ...cached,
+              isStale: true,
+              extra: { lastError: 'Price refresh fallback failed' }
+            };
+            results.set(mint, stalePrice);
+            this.updateCacheAndNotify(stalePrice);
           }
         })
       );
@@ -318,7 +271,6 @@ class LivePriceService {
   private updateCacheAndNotify(price: LivePrice) {
     this.cache.set(price.mint, price);
 
-    // Notify specific listeners
     const specific = this.listeners.get(price.mint);
     if (specific) {
       for (const listener of specific) {
@@ -330,7 +282,6 @@ class LivePriceService {
       }
     }
 
-    // Notify global listeners
     for (const globalListener of this.globalListeners) {
       try {
         globalListener(price);
@@ -351,16 +302,15 @@ class LivePriceService {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    console.log('[LivePriceService] Live price engine started (Jupiter Primary / DexScreener Fallback).');
+    console.log('[LivePriceService] Live price engine started (Jupiter V3 Primary / DexScreener Fallback).');
 
     if (onPriceUpdate) {
       this.subscribeAll(onPriceUpdate);
     }
 
-    // High-frequency, batch-driven price loop (every 1200ms)
     let isFetching = false;
     this.monitorInterval = setInterval(async () => {
-      if (isFetching) return; // Prevent overlapping iterations
+      if (isFetching) return;
       isFetching = true;
 
       try {

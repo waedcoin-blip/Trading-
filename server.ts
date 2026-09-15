@@ -26,6 +26,7 @@ import {
   ConnectionStatus 
 } from './src/types.js';
 import { livePriceService, LivePrice } from './src/server/priceService.js';
+import { jupiterService } from './src/server/jupiterService.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
 const appDir = typeof __dirname !== 'undefined'
@@ -41,13 +42,12 @@ app.use(express.json());
 // Helper to construct sanitized state without exposing sensitive secrets
 function getSanitizedState() {
   const rawSettings = db.getSettings();
-  const jupApiKey = livePriceService.getJupiterApiKey();
   const sanitizedSettings: Settings = {
-    ...rawSettings,
-    jupiter_api_key: jupApiKey ? '[CONFIGURED]' : ''
+    ...rawSettings
   };
+  delete (sanitizedSettings as any).jupiter_api_key;
 
-  currentConnectionStatus.jupiter = livePriceService.getJupiterStatus();
+  currentConnectionStatus.jupiter = jupiterService.getStatus();
 
   return {
     settings: sanitizedSettings,
@@ -63,7 +63,30 @@ function getSanitizedState() {
 
 // API: Health endpoint for Render & local health checks
 app.get(['/health', '/api/health'], (req, res) => {
-  res.json({ ok: true, status: 'online' });
+  res.json({
+    status: 'ok',
+    service: 'trading-server',
+    uptimeSec: Math.floor(process.uptime()),
+    timestamp: Date.now()
+  });
+});
+
+// API: Real Jupiter V3 Health Diagnostic Endpoint
+app.get('/api/jupiter/health', async (req, res) => {
+  try {
+    const health = await jupiterService.getHealth();
+    res.json(health);
+  } catch (err: any) {
+    res.status(500).json({
+      ok: false,
+      status: 'CONNECTION_ERROR',
+      latencyMs: 0,
+      error: err?.message || 'Failed to query Jupiter health',
+      timestamp: Date.now(),
+      configured: Boolean(jupiterService.getApiKey()),
+      endpointVersion: 'V3'
+    });
+  }
 });
 
 // API: Get current state
@@ -318,11 +341,7 @@ async function initSolanaConnection() {
   }
 
   // Jupiter API credentials status
-  if (settings.jupiter_api_key) {
-    currentConnectionStatus.jupiter = 'CONNECTED';
-  } else {
-    currentConnectionStatus.jupiter = 'NOT_CONFIGURED';
-  }
+  currentConnectionStatus.jupiter = jupiterService.getStatus();
 
   // LaserStream configuration status
   if (settings.laserstream_key) {

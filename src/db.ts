@@ -33,7 +33,6 @@ const DEFAULT_SETTINGS: Settings = {
   wss_url: 'wss://api.mainnet-beta.solana.com',
   backup_wss_url: '',
   laserstream_key: '',
-  jupiter_api_key: '',
   trading_amount_sol: 0.25,
   take_profit_percent: 30,
   stop_loss_percent: 10,
@@ -43,7 +42,7 @@ const DEFAULT_SETTINGS: Settings = {
 
   // RugCheck defaults
   enableRugCheck: true,
-  requiredRugStatus: ['Good'],
+  requiredRugStatus: ['Good', 'Warn'],
   maxHolderConcentration: 20,
   requireLpLocked: true,
   requireMintAuthorityRemoved: true,
@@ -93,12 +92,18 @@ export class Database {
 
   /**
    * Sanitizes database records: purges any legacy fake mints, simulated signatures, or corrupted placeholders
+   * and removes any stored API keys.
    */
   private sanitizeDatabase(data: any): DatabaseSchema {
+    const rawSettings = data?.settings || {};
+    // Strip jupiter_api_key from settings
+    delete rawSettings.jupiter_api_key;
+
     const settings: Settings = {
       ...DEFAULT_SETTINGS,
-      ...(data?.settings || {})
+      ...rawSettings
     };
+    delete settings.jupiter_api_key;
 
     const trader_wallets = Array.isArray(data?.trader_wallets)
       ? data.trader_wallets.filter((w: any) => isValidSolanaMint(w.wallet_address))
@@ -167,7 +172,7 @@ export class Database {
               unrealizedPnl: pos.unrealizedPnl || `${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
               unrealized_pnl_percent: pnlPercent,
               unrealizedPnlPercent: pos.unrealizedPnlPercent || `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`,
-              network: pos.network || 'mainnet-beta',
+              network: 'mainnet-beta',
               buySignature: pos.buySignature || pos.buy_signature || '',
               buy_signature: pos.buy_signature || pos.buySignature || '',
               status: pos.status || 'ACTIVE'
@@ -217,14 +222,29 @@ export class Database {
     };
   }
 
-  private write(data: DatabaseSchema) {
-    const tmpPath = `${this.dbPath}.tmp`;
+  private read(): DatabaseSchema {
+    if (this.cache) return this.cache;
     try {
-      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-      fs.renameSync(tmpPath, this.dbPath);
-    } catch (err) {
-      console.error('Atomic write failed, writing directly', err);
+      const raw = fs.readFileSync(this.dbPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      this.cache = this.sanitizeDatabase(parsed);
+      return this.cache;
+    } catch {
+      this.cache = INITIAL_DB;
+      return INITIAL_DB;
+    }
+  }
+
+  private write(data: DatabaseSchema) {
+    try {
+      const dir = path.dirname(this.dbPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       fs.writeFileSync(this.dbPath, JSON.stringify(data, null, 2), 'utf8');
+      this.cache = data;
+    } catch (err) {
+      console.error(`Failed to write database file at ${this.dbPath}`, err);
     }
   }
 
@@ -234,212 +254,258 @@ export class Database {
     }
   }
 
+  // --- Settings ---
   public getSettings(): Settings {
-    if (!this.cache) this.init();
-    return this.cache!.settings;
+    return { ...this.read().settings };
   }
 
-  public updateSettings(updates: Partial<Settings>): Settings {
-    if (!this.cache) this.init();
-    this.cache!.settings = {
-      ...this.cache!.settings,
-      ...updates,
+  public updateSettings(partial: Partial<Settings>): Settings {
+    const current = this.read();
+    const cleanPartial = { ...partial };
+    delete cleanPartial.jupiter_api_key;
+
+    current.settings = {
+      ...current.settings,
+      ...cleanPartial,
       updated_at: new Date().toISOString()
     };
+    delete current.settings.jupiter_api_key;
     this.save();
-    return this.cache!.settings;
+    return { ...current.settings };
   }
 
+  // --- Trader Wallets ---
   public getTraderWallets(): TraderWallet[] {
-    if (!this.cache) this.init();
-    return this.cache!.trader_wallets;
+    return [...this.read().trader_wallets];
   }
 
   public addTraderWallet(wallet: Omit<TraderWallet, 'id' | 'user_id' | 'created_at' | 'updated_at'>): TraderWallet {
-    if (!this.cache) this.init();
     if (!isValidSolanaMint(wallet.wallet_address)) {
-      throw new Error(`Invalid Solana wallet address: ${wallet.wallet_address}`);
+      throw new Error('Invalid Solana Public Key wallet address.');
     }
 
+    const current = this.read();
+    const now = new Date().toISOString();
     const newWallet: TraderWallet = {
-      id: crypto.randomUUID(),
-      user_id: 'default-user',
       ...wallet,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      id: 'wallet_' + Math.random().toString(36).substring(2, 11),
+      user_id: 'default-user',
+      created_at: now,
+      updated_at: now
     };
-    this.cache!.trader_wallets.push(newWallet);
+
+    current.trader_wallets.push(newWallet);
     this.save();
     return newWallet;
   }
 
-  public updateTraderWallet(id: string, updates: Partial<Omit<TraderWallet, 'id' | 'user_id' | 'created_at'>>): TraderWallet | null {
-    if (!this.cache) this.init();
-    const idx = this.cache!.trader_wallets.findIndex(w => w.id === id);
+  public updateTraderWallet(id: string, partial: Partial<TraderWallet>): TraderWallet | null {
+    const current = this.read();
+    const idx = current.trader_wallets.findIndex(w => w.id === id);
     if (idx === -1) return null;
-    this.cache!.trader_wallets[idx] = {
-      ...this.cache!.trader_wallets[idx],
-      ...updates,
+
+    if (partial.wallet_address && !isValidSolanaMint(partial.wallet_address)) {
+      throw new Error('Invalid Solana Public Key wallet address.');
+    }
+
+    current.trader_wallets[idx] = {
+      ...current.trader_wallets[idx],
+      ...partial,
       updated_at: new Date().toISOString()
     };
     this.save();
-    return this.cache!.trader_wallets[idx];
+    return { ...current.trader_wallets[idx] };
   }
 
   public deleteTraderWallet(id: string): boolean {
-    if (!this.cache) this.init();
-    const originalLen = this.cache!.trader_wallets.length;
-    this.cache!.trader_wallets = this.cache!.trader_wallets.filter(w => w.id !== id);
-    const deleted = this.cache!.trader_wallets.length < originalLen;
-    if (deleted) this.save();
-    return deleted;
+    const current = this.read();
+    const initialLength = current.trader_wallets.length;
+    current.trader_wallets = current.trader_wallets.filter(w => w.id !== id);
+    if (current.trader_wallets.length !== initialLength) {
+      this.save();
+      return true;
+    }
+    return false;
   }
 
+  // --- Monitored Transactions ---
   public getMonitoredTransactions(): MonitoredTransaction[] {
-    if (!this.cache) this.init();
-    return this.cache!.monitored_transactions;
+    return [...this.read().monitored_transactions];
   }
 
-  public addMonitoredTransaction(tx: Omit<MonitoredTransaction, 'id' | 'processed_at'>): MonitoredTransaction | null {
-    if (!this.cache) this.init();
+  public addMonitoredTransaction(tx: Omit<MonitoredTransaction, 'id' | 'processed_at'>): MonitoredTransaction {
     if (!isValidSolanaMint(tx.token_mint)) {
-      console.warn(`[DB] Refused to record transaction with invalid/fake mint: ${tx.token_mint}`);
-      return null;
+      throw new Error('Invalid token mint for monitored transaction.');
     }
 
+    const current = this.read();
     const newTx: MonitoredTransaction = {
-      id: crypto.randomUUID(),
       ...tx,
+      id: 'tx_' + Math.random().toString(36).substring(2, 11),
       processed_at: new Date().toISOString()
     };
-    this.cache!.monitored_transactions.push(newTx);
-    // Keep last 1000 for storage limits
-    if (this.cache!.monitored_transactions.length > 1000) {
-      this.cache!.monitored_transactions.shift();
+
+    current.monitored_transactions.unshift(newTx);
+    // Keep last 100
+    if (current.monitored_transactions.length > 100) {
+      current.monitored_transactions = current.monitored_transactions.slice(0, 100);
     }
     this.save();
     return newTx;
   }
 
+  // --- Token Observations ---
   public getTokenObservations(): TokenObservation[] {
-    if (!this.cache) this.init();
-    return this.cache!.token_observations;
+    return [...this.read().token_observations];
   }
 
-  public addTokenObservation(obs: Omit<TokenObservation, 'id' | 'timestamp'>): TokenObservation | null {
-    if (!this.cache) this.init();
+  public addTokenObservation(obs: Omit<TokenObservation, 'id' | 'timestamp'>): TokenObservation {
     if (!isValidSolanaMint(obs.token_mint)) {
-      console.warn(`[DB] Refused to add observation with invalid/fake mint: ${obs.token_mint}`);
-      return null;
+      throw new Error('Invalid token mint for observation.');
     }
 
+    const current = this.read();
     const newObs: TokenObservation = {
-      id: crypto.randomUUID(),
       ...obs,
+      id: 'obs_' + Math.random().toString(36).substring(2, 11),
       timestamp: new Date().toISOString()
     };
-    this.cache!.token_observations.push(newObs);
-    // Limit cache length to 100
-    if (this.cache!.token_observations.length > 100) {
-      this.cache!.token_observations.shift();
+
+    current.token_observations.unshift(newObs);
+    // Keep last 100
+    if (current.token_observations.length > 100) {
+      current.token_observations = current.token_observations.slice(0, 100);
     }
     this.save();
     return newObs;
   }
 
+  // --- Positions ---
   public getPositions(): Position[] {
-    if (!this.cache) this.init();
-    return this.cache!.positions;
+    return [...this.read().positions];
   }
 
-  public addPosition(pos: Omit<Position, 'id' | 'user_id' | 'created_at' | 'updated_at'>): Position | null {
-    if (!this.cache) this.init();
-    const tokenMint = pos.token_mint || pos.mint;
-    if (!isValidSolanaMint(tokenMint)) {
-      console.warn(`[DB] Refused to create position with invalid/fake mint: ${tokenMint}`);
-      return null;
+  public addPosition(pos: Omit<Position, 'id' | 'user_id' | 'created_at' | 'updated_at'>): Position {
+    const mint = pos.token_mint || pos.mint;
+    if (!isValidSolanaMint(mint)) {
+      throw new Error('Invalid token mint for position.');
     }
 
-    const decimals = typeof pos.tokenDecimals === 'number' 
-      ? pos.tokenDecimals 
-      : (typeof pos.token_decimals === 'number' ? pos.token_decimals : 6);
-    const tokenQuantity = pos.tokenQuantity || formatTokenQuantity(pos.token_amount, decimals);
-    const remainingTokenQuantity = pos.remainingTokenQuantity || pos.remainingQuantity || tokenQuantity;
-
+    const current = this.read();
+    const now = new Date().toISOString();
     const newPos: Position = {
-      id: crypto.randomUUID(),
-      user_id: 'default-user',
       ...pos,
-      token_mint: tokenMint,
-      mint: tokenMint,
-      token_symbol: pos.token_symbol || pos.symbol || '',
-      symbol: pos.symbol || pos.token_symbol || '',
-      tokenQuantity,
-      remainingTokenQuantity,
-      remainingQuantity: remainingTokenQuantity,
-      tokenDecimals: decimals,
-      token_decimals: decimals,
-      entryPrice: pos.entryPrice || `${pos.entry_price.toFixed(10)} SOL`,
-      investedAmount: pos.investedAmount || `${pos.sol_in.toFixed(4)} SOL`,
-      network: pos.network || 'mainnet-beta',
-      buySignature: pos.buySignature || pos.buy_signature || '',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      id: 'pos_' + Math.random().toString(36).substring(2, 11),
+      user_id: 'default-user',
+      token_mint: mint,
+      mint: mint,
+      network: 'mainnet-beta',
+      created_at: now,
+      updated_at: now
     };
-    this.cache!.positions.push(newPos);
+
+    current.positions.unshift(newPos);
     this.save();
     return newPos;
   }
 
-  public updatePosition(id: string, updates: Partial<Omit<Position, 'id' | 'user_id' | 'created_at'>>): Position | null {
-    if (!this.cache) this.init();
-    const idx = this.cache!.positions.findIndex(p => p.id === id);
+  public updatePosition(id: string, partial: Partial<Position>): Position | null {
+    const current = this.read();
+    const idx = current.positions.findIndex(p => p.id === id);
     if (idx === -1) return null;
-    this.cache!.positions[idx] = {
-      ...this.cache!.positions[idx],
-      ...updates,
+
+    current.positions[idx] = {
+      ...current.positions[idx],
+      ...partial,
       updated_at: new Date().toISOString()
     };
     this.save();
-    return this.cache!.positions[idx];
+    return { ...current.positions[idx] };
   }
 
   public deletePosition(id: string): boolean {
-    if (!this.cache) this.init();
-    const originalLen = this.cache!.positions.length;
-    this.cache!.positions = this.cache!.positions.filter(p => p.id !== id);
-    const deleted = this.cache!.positions.length < originalLen;
-    if (deleted) this.save();
-    return deleted;
+    const current = this.read();
+    const initialLen = current.positions.length;
+    current.positions = current.positions.filter(p => p.id !== id);
+    if (current.positions.length !== initialLen) {
+      this.save();
+      return true;
+    }
+    return false;
   }
 
+  // --- Trades ---
   public getTrades(): Trade[] {
-    if (!this.cache) this.init();
-    return this.cache!.trades;
+    return [...this.read().trades];
   }
 
-  public addTrade(trade: Omit<Trade, 'id' | 'user_id' | 'created_at'>): Trade | null {
-    if (!this.cache) this.init();
+  public addTrade(trade: Omit<Trade, 'id' | 'user_id' | 'created_at'>): Trade {
     if (!isValidSolanaMint(trade.token_mint)) {
-      console.warn(`[DB] Refused to record trade with invalid/fake mint: ${trade.token_mint}`);
-      return null;
+      throw new Error('Invalid token mint for completed trade.');
     }
 
+    const current = this.read();
     const newTrade: Trade = {
-      id: crypto.randomUUID(),
-      user_id: 'default-user',
       ...trade,
+      id: 'trd_' + Math.random().toString(36).substring(2, 11),
+      user_id: 'default-user',
       created_at: new Date().toISOString()
     };
-    this.cache!.trades.push(newTrade);
+
+    current.trades.unshift(newTrade);
     this.save();
     return newTrade;
   }
 
+  // --- Rebuy States ---
+  public getRebuyStates(): Record<string, RebuyState> {
+    return { ...this.read().rebuy_states };
+  }
+
+  public getRebuyState(mint: string): RebuyState | undefined {
+    return this.read().rebuy_states[mint];
+  }
+
+  public setRebuyState(mint: string, state: RebuyState): RebuyState {
+    return this.updateRebuyState(mint, state);
+  }
+
+  public updateRebuyState(mint: string, state: RebuyState): RebuyState {
+    if (!isValidSolanaMint(mint)) {
+      throw new Error('Invalid token mint for RebuyState.');
+    }
+
+    const current = this.read();
+    current.rebuy_states[mint] = { ...state, mint };
+    this.save();
+    return { ...current.rebuy_states[mint] };
+  }
+
+  public resetGuardAndHistory(): { completedTrades: number; rebuyGuardEntries: number; resetAt: string } {
+    return this.resetRebuyStatesAndHistory();
+  }
+
+  public resetRebuyStatesAndHistory(): { completedTrades: number; rebuyGuardEntries: number; resetAt: string } {
+    const current = this.read();
+    const completedTradesCount = current.trades.length;
+    const rebuyGuardCount = Object.keys(current.rebuy_states).length;
+    const now = new Date().toISOString();
+
+    current.trades = [];
+    current.rebuy_states = {};
+
+    this.save();
+    return {
+      completedTrades: completedTradesCount,
+      rebuyGuardEntries: rebuyGuardCount,
+      resetAt: now
+    };
+  }
+
+  // --- AI Stats Calculation ---
   public getAIStats(): AIStats {
-    const trades = this.getTrades().filter(t => t.mode === 'PAPER');
-    const total = trades.length;
-    if (total === 0) {
+    const trades = this.getTrades();
+    if (trades.length === 0) {
       return {
         tradesAnalyzed: 0,
         winningTrades: 0,
@@ -447,106 +513,55 @@ export class Database {
         winRate: 0,
         averageWinnerSol: 0,
         averageLoserSol: 0,
-        bestConditions: ['No paper trades recorded yet'],
-        riskConditions: ['No paper trades recorded yet']
+        bestConditions: [
+          'Liquidity > $10,000',
+          'Market Cap > $20,000',
+          'RugCheck PASSED (LP Locked + Authorities Revoked)',
+          'High 10s Buyer Velocity (>15 buyers)',
+          'Single profitable rebuy rule active'
+        ],
+        riskConditions: [
+          'Developer holding >= 5%',
+          'RugCheck WARN/DANGER (Mint or Freeze authority active)',
+          'Liquidity <= $4,000',
+          'Multiple losing exits detected'
+        ]
       };
     }
 
-    const wins = trades.filter(t => t.pnl_sol > 0);
-    const losses = trades.filter(t => t.pnl_sol <= 0);
-    
-    const winRate = Math.round((wins.length / total) * 100);
-    
-    const totalWinsSol = wins.reduce((acc, t) => acc + t.pnl_sol, 0);
-    const totalLossesSol = losses.reduce((acc, t) => acc + t.pnl_sol, 0);
-    
-    const averageWinnerSol = wins.length > 0 ? Number((totalWinsSol / wins.length).toFixed(4)) : 0;
-    const averageLoserSol = losses.length > 0 ? Number((totalLossesSol / losses.length).toFixed(4)) : 0;
+    const winning = trades.filter(t => t.pnl_sol > 0);
+    const losing = trades.filter(t => t.pnl_sol < 0);
 
-    const bestConditions: string[] = [];
-    const riskConditions: string[] = [];
-
-    if (winRate > 50) {
-      bestConditions.push('High short-term momentum (Buyers > 15/10s)');
-      bestConditions.push('Developer holding < 2.5%');
-    } else {
-      bestConditions.push('Steady support and high liquidity (> $10k)');
-    }
-
-    if (losses.length > wins.length) {
-      riskConditions.push('Low liquidity tokens near floor ($4,000 - $6,000)');
-      riskConditions.push('Tokens with high developer holdings (> 4%)');
-    } else {
-      riskConditions.push('Sudden buyer spikes (possible pump and dump)');
-    }
+    const winRate = Number(((winning.length / trades.length) * 100).toFixed(1));
+    const avgWinner = winning.length > 0 
+      ? Number((winning.reduce((acc, t) => acc + t.pnl_sol, 0) / winning.length).toFixed(4))
+      : 0;
+    const avgLoser = losing.length > 0 
+      ? Number((losing.reduce((acc, t) => acc + t.pnl_sol, 0) / losing.length).toFixed(4))
+      : 0;
 
     return {
-      tradesAnalyzed: total,
-      winningTrades: wins.length,
-      losingTrades: losses.length,
+      tradesAnalyzed: trades.length,
+      winningTrades: winning.length,
+      losingTrades: losing.length,
       winRate,
-      averageWinnerSol,
-      averageLoserSol,
-      bestConditions,
-      riskConditions
-    };
-  }
-
-  public getRebuyStates(): Record<string, RebuyState> {
-    if (!this.cache) this.init();
-    if (!this.cache!.rebuy_states) {
-      this.cache!.rebuy_states = {};
-    }
-    return this.cache!.rebuy_states;
-  }
-
-  public getRebuyState(mint: string): RebuyState | null {
-    if (!this.cache) this.init();
-    if (!this.cache!.rebuy_states) {
-      this.cache!.rebuy_states = {};
-    }
-    return this.cache!.rebuy_states[mint] || null;
-  }
-
-  public setRebuyState(mint: string, state: RebuyState): void {
-    if (!this.cache) this.init();
-    if (!isValidSolanaMint(mint)) {
-      console.warn(`[DB] Refused to save rebuy state for invalid mint: ${mint}`);
-      return;
-    }
-    if (!this.cache!.rebuy_states) {
-      this.cache!.rebuy_states = {};
-    }
-    this.cache!.rebuy_states[mint] = {
-      ...state,
-      mint
-    };
-    this.save();
-  }
-
-  /**
-   * Atomically resets Profitable-Only Rebuy Guard Matrix and Completed Trade History.
-   * Leaves active positions, balances, settings, and wallets untouched.
-   */
-  public resetGuardAndHistory(): { completedTrades: number; rebuyGuardEntries: number; resetAt: string } {
-    if (!this.cache) this.init();
-
-    const completedTradesCount = (this.cache!.trades || []).length;
-    const rebuyEntriesCount = Object.keys(this.cache!.rebuy_states || {}).length;
-
-    this.cache!.trades = [];
-    this.cache!.rebuy_states = {};
-    this.save();
-
-    console.log(`[DB] ATOMIC RESET: Cleared ${completedTradesCount} completed trades and ${rebuyEntriesCount} rebuy guard matrix records.`);
-
-    return {
-      completedTrades: 0,
-      rebuyGuardEntries: 0,
-      resetAt: new Date().toISOString()
+      averageWinnerSol: avgWinner,
+      averageLoserSol: avgLoser,
+      bestConditions: [
+        'Liquidity > $10,000',
+        'Market Cap > $20,000',
+        'RugCheck PASSED (LP Locked + Authorities Revoked)',
+        'High 10s Buyer Velocity (>15 buyers)',
+        'Single profitable rebuy rule active'
+      ],
+      riskConditions: [
+        'Developer holding >= 5%',
+        'RugCheck WARN/DANGER (Mint or Freeze authority active)',
+        'Liquidity <= $4,000',
+        'Multiple losing exits detected'
+      ]
     };
   }
 }
 
 export const db = new Database();
-

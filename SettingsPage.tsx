@@ -34,7 +34,6 @@ export default function SettingsPage({ state, sendAction }: SettingsPageProps) {
   const [requireMintAuthorityRemoved, setRequireMintAuthorityRemoved] = useState(settings.requireMintAuthorityRemoved ?? true);
   const [requireFreezeAuthorityRemoved, setRequireFreezeAuthorityRemoved] = useState(settings.requireFreezeAuthorityRemoved ?? true);
   const [maxRiskScore, setMaxRiskScore] = useState(settings.maxRiskScore ?? 300);
-  const [requiredRugStatus, setRequiredRugStatus] = useState<string[]>(settings.requiredRugStatus ?? ['Good', 'Warn']);
   
   const [successMsg, setSuccessMsg] = useState('');
 
@@ -49,7 +48,7 @@ export default function SettingsPage({ state, sendAction }: SettingsPageProps) {
       backup_wss_url: backupWssUrl,
       laserstream_key: laserKey,
       enableRugCheck,
-      requiredRugStatus,
+      requiredRugStatus: ['Good'],
       maxHolderConcentration: Number(maxHolderConcentration),
       requireLpLocked,
       requireMintAuthorityRemoved,
@@ -117,9 +116,9 @@ export default function SettingsPage({ state, sendAction }: SettingsPageProps) {
 
         <div className="p-3 bg-[#0b0e14] border border-[#1e2533] rounded flex justify-between items-center">
           <div>
-            <span className="text-[10px] text-[#6b7280] block font-bold uppercase tracking-wider">Jupiter Price API V3</span>
+            <span className="text-[10px] text-[#6b7280] block font-bold uppercase tracking-wider">Jupiter Price API</span>
             <span className="text-xs text-[#f3f4f6] font-medium font-mono truncate max-w-[130px] block">
-              {connection.jupiter === 'CONNECTED' ? 'V3 Mainnet Active' : connection.jupiter}
+              {connection.jupiter === 'CONNECTED' ? 'Jupiter Sync Active' : 'Server API key required'}
             </span>
           </div>
           {getStatusBadge(connection.jupiter)}
@@ -208,18 +207,14 @@ export default function SettingsPage({ state, sendAction }: SettingsPageProps) {
 
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="block text-xs font-medium text-[#9ca3af]">Jupiter Price API V3</label>
-                <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${
-                  connection.jupiter === 'CONNECTED' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
-                }`}>
-                  {connection.jupiter}
-                </span>
+                <label className="block text-xs font-medium text-[#9ca3af]">Jupiter API Key</label>
+                <span className="text-[9px] bg-[#10b981]/10 text-emerald-400 px-1.5 py-0.5 rounded font-bold">Swap Engine</span>
               </div>
-              <div className="bg-[#0b0e14] border border-[#1e2533] rounded p-2.5 text-xs font-mono text-[#9ca3af]">
-                Jupiter API Key: Managed securely by server environment (<code className="text-blue-400 font-bold">JUPITER_API_KEY</code>)
+              <div className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-3 py-2 text-xs text-emerald-300 font-mono">
+                Managed securely by Render: JUPITER_API_KEY
               </div>
               <p className="text-[10px] text-[#6b7280] mt-1">
-                High-frequency mainnet price feed & execution quotes via Jupiter V3 API (<code className="text-[#9ca3af]">api.jup.ag/price/v3</code>).
+                The Jupiter API key is server-side only. Configure it in Render Environment Variables; it is never stored in the browser or database.
               </p>
             </div>
 
@@ -296,29 +291,10 @@ export default function SettingsPage({ state, sendAction }: SettingsPageProps) {
             <div className="bg-[#0b0e14] border border-[#1e2533] p-3 rounded flex flex-col justify-center">
               <span className="text-xs font-medium text-[#9ca3af] block mb-1">Mandatory Risk Level</span>
               <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const hasWarn = requiredRugStatus.some(s => s.toLowerCase() === 'warn');
-                    if (hasWarn) {
-                      setRequiredRugStatus(['Good']);
-                    } else {
-                      setRequiredRugStatus(['Good', 'Warn']);
-                    }
-                  }}
-                  className={`text-xs font-bold px-2.5 py-1 rounded border transition ${
-                    requiredRugStatus.some(s => s.toLowerCase() === 'warn')
-                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20 hover:bg-amber-500/20'
-                      : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20'
-                  }`}
-                >
-                  {requiredRugStatus.some(s => s.toLowerCase() === 'warn') ? 'GOOD + WARN ALLOWED' : 'GOOD ONLY'}
-                </button>
-                <span className="text-[10px] text-[#6b7280]">
-                  {requiredRugStatus.some(s => s.toLowerCase() === 'warn')
-                    ? 'Tokens marked Warn are allowed if passing security limits.'
-                    : 'Tokens marked Warn/Danger are rejected.'}
+                <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-bold px-2.5 py-1 rounded">
+                  GOOD ONLY
                 </span>
+                <span className="text-[10px] text-[#6b7280]">Tokens marked Warn/Danger are rejected.</span>
               </div>
             </div>
           </div>

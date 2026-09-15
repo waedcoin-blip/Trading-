@@ -11,7 +11,7 @@ export interface Settings {
   wss_url: string;
   backup_wss_url: string;
   laserstream_key: string;
-  jupiter_api_key: string;
+  jupiter_api_key?: string; // Deprecated/Removed from storage; managed strictly via JUPITER_API_KEY env var
   trading_amount_sol: number;
   take_profit_percent: number;
   stop_loss_percent: number;
@@ -117,7 +117,7 @@ export interface ActivePosition {
   unrealizedPnlPercent?: string;
 
   buySignature?: string;
-  network: 'devnet' | 'mainnet-beta';
+  network: 'mainnet-beta';
 }
 
 export interface Position extends ActivePosition {
@@ -160,7 +160,7 @@ export interface Position extends ActivePosition {
   unrealizedPnl?: string;
   unrealized_pnl_percent: number;
   unrealizedPnlPercent?: string;
-  network: 'devnet' | 'mainnet-beta';
+  network: 'mainnet-beta';
   status: 'ACTIVE' | 'SOLD' | 'ERROR';
   data_error?: boolean;
   data_error_message?: string;
@@ -169,6 +169,11 @@ export interface Position extends ActivePosition {
   rugcheck?: RugCheckResult;
   created_at: string;
   updated_at: string;
+
+  // Real-time metadata
+  priceUpdatedAt?: number;
+  priceSource?: 'jupiter' | 'fallback';
+  isStale?: boolean;
 }
 
 export interface Trade {
@@ -222,7 +227,7 @@ export interface ConnectionStatus {
   rpc: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
   wss: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
   laserstream: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
-  jupiter: 'CONNECTED' | 'INVALID_API_KEY' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED';
+  jupiter: 'CONNECTED' | 'INVALID_API_KEY' | 'RATE_LIMITED' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED';
 }
 
 export interface TradeAuditRecord {
@@ -277,4 +282,3 @@ export interface ServerState {
   aiStats: AIStats;
   rebuyStates: Record<string, RebuyState>;
 }
-

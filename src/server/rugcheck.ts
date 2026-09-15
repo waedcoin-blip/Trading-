@@ -237,7 +237,7 @@ export function validateRugCheck(
     };
   }
 
-  const requiredStatus = settings.requiredRugStatus || ['Good'];
+  const requiredStatus = settings.requiredRugStatus || ['Good', 'Warn'];
   const maxHolders = typeof settings.maxHolderConcentration === 'number' ? settings.maxHolderConcentration : 20;
   const requireLp = settings.requireLpLocked !== false;
   const requireNoMintAuth = settings.requireMintAuthorityRemoved !== false;
