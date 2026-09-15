@@ -9,16 +9,18 @@ import {
   Cpu,
   Terminal,
   Zap,
-  LayoutDashboard
+  LayoutDashboard,
+  Brain
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ServerState, Settings, ConnectionStatus, AIStats } from './types';
 import WatchlistPage from './components/WatchlistPage';
 import TradingPage from './components/TradingPage';
 import SettingsPage from './components/SettingsPage';
+import AILearningPage from './components/AILearningPage';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'watchlist' | 'trading' | 'settings'>('watchlist');
+  const [activeTab, setActiveTab] = useState<'watchlist' | 'trading' | 'ai-learning' | 'settings'>('watchlist');
   const [state, setState] = useState<ServerState | null>(null);
   const [backendOnline, setBackendOnline] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -305,6 +307,23 @@ export default function App() {
           </button>
 
           <button 
+            onClick={() => setActiveTab('ai-learning')}
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs font-bold transition relative ${
+              activeTab === 'ai-learning' ? 'text-white' : 'text-[#6b7280] hover:text-[#d1d5db]'
+            }`}
+          >
+            {activeTab === 'ai-learning' && (
+              <motion.div 
+                layoutId="activeTabIndicator"
+                className="absolute inset-0 bg-[#3b82f6]/10 border-b-2 border-blue-500 rounded-sm"
+                transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              />
+            )}
+            <Brain className="w-3.5 h-3.5 text-blue-400" />
+            AI LEARNING
+          </button>
+
+          <button 
             onClick={() => setActiveTab('settings')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs font-bold transition relative ${
               activeTab === 'settings' ? 'text-white' : 'text-[#6b7280] hover:text-[#d1d5db]'
@@ -362,6 +381,9 @@ export default function App() {
             )}
             {activeTab === 'trading' && (
               <TradingPage state={state} sendAction={sendAction} />
+            )}
+            {activeTab === 'ai-learning' && (
+              <AILearningPage state={state} sendAction={sendAction} />
             )}
             {activeTab === 'settings' && (
               <SettingsPage state={state} sendAction={sendAction} />

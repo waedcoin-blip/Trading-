@@ -272,6 +272,149 @@ export interface RebuyDecision {
   state?: RebuyState;
 }
 
+export interface LearningRecord {
+  tradeId: string;
+  network: string;
+  mint: string;
+  symbol: string;
+  sourceTraderId: string;
+  sourceTraderName: string;
+
+  entryPrice: number;
+  exitPrice: number;
+  quantity: number;
+
+  realizedPnL: number;
+  realizedPnLPercent: number;
+  holdingDuration: number; // in seconds
+
+  aiScoreAtEntry: number;
+  aiConfidenceAtEntry: number;
+
+  marketCapAtEntry: number | 'UNKNOWN';
+  liquidityAtEntry: number | 'UNKNOWN';
+  volumeAtEntry: number | 'UNKNOWN';
+
+  buyerVelocity: number | 'UNKNOWN';
+  sellerVelocity: number | 'UNKNOWN';
+
+  tokenAge?: number | 'UNKNOWN';
+  RugCheckStatus: string;
+  RugCheckScore: number;
+
+  mintAuthority: string | null;
+  freezeAuthority: string | null;
+  lpStatus: string;
+
+  entryReason: string;
+  exitReason: string;
+
+  takeProfitTriggered: boolean;
+  stopLossTriggered: boolean;
+
+  rebuyNumber: number;
+  wasRebuy: boolean;
+
+  timestamp: string;
+}
+
+export interface ScoreFactorBreakdown {
+  category: 'Base Analysis' | 'Historical Pattern' | 'Trader History' | 'Liquidity Quality' | 'Momentum' | 'Risk Adjustment' | 'RugCheck Gate';
+  impact: number;
+  reason: string;
+}
+
+export interface LearnedScoreResult {
+  finalScore: number;
+  confidence: number; // 0 to 100 (%)
+  baseScore: number;
+  breakdown: ScoreFactorBreakdown[];
+  signals: {
+    positive: string[];
+    risks: string[];
+  };
+  sampleSizeUsed: number;
+}
+
+export interface LearnedPattern {
+  id: string;
+  patternName: string;
+  description: string;
+  sampleSize: number;
+  winRate: number; // 0 - 100 (%)
+  averagePnLPercent: number;
+  averagePnLSol: number;
+  confidence: number; // 0 - 100 (%)
+  type: 'WINNING' | 'LOSING';
+}
+
+export interface TraderIntelligence {
+  traderId: string;
+  traderName: string;
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  winRate: number; // 0 - 100 (%)
+  averagePnLPercent: number;
+  medianPnLPercent: number;
+  averageHoldingTimeSec: number;
+  averageEntryLiquidity: number;
+  averageAIScore: number;
+  takeProfitRate: number; // 0 - 100 (%)
+  stopLossRate: number; // 0 - 100 (%)
+  rebuySuccessRate: number; // 0 - 100 (%)
+  confidence: number; // 0 - 100 (%)
+}
+
+export interface AIScoreBucketPerformance {
+  range: string;
+  minScore: number;
+  maxScore: number;
+  trades: number;
+  winningTrades: number;
+  winRate: number;
+  averagePnLPercent: number;
+  averagePnLSol: number;
+}
+
+export interface AIPerformanceMetrics {
+  totalPredictions: number;
+  totalCompletedTrades: number;
+  aiWins: number;
+  aiLosses: number;
+  aiWinRate: number;
+  averagePredictedScore: number;
+  averageWinningScore: number;
+  averageLosingScore: number;
+  averagePnLPercent: number;
+  averagePnLSol: number;
+  predictionAccuracy: number;
+  falsePositiveRate: number;
+  falseNegativeRate: number;
+  tpPredictionAccuracy: number;
+  slPredictionAccuracy: number;
+  scoreBuckets: AIScoreBucketPerformance[];
+  lastUpdated: string;
+}
+
+export interface AILearningSummary {
+  status: 'ACTIVE' | 'INITIALIZING';
+  totalLearningTrades: number;
+  profitableTrades: number;
+  losingTrades: number;
+  winRate: number;
+  averageLearnedPnL: number;
+  patternsLearned: number;
+  tradersLearned: number;
+  lastUpdated: string;
+}
+
+export interface AILearningState {
+  learningRecords: Record<string, LearningRecord>;
+  performance: AIPerformanceMetrics;
+  lastUpdated: string;
+}
+
 export interface ServerState {
   settings: Settings;
   traders: TraderWallet[];
@@ -281,4 +424,5 @@ export interface ServerState {
   connection: ConnectionStatus;
   aiStats: AIStats;
   rebuyStates: Record<string, RebuyState>;
+  aiLearningSummary?: AILearningSummary;
 }

@@ -9,7 +9,8 @@ import {
   Position, 
   Trade, 
   AIStats,
-  RebuyState
+  RebuyState,
+  LearningRecord
 } from './types';
 import { isValidSolanaMint, formatTokenQuantity } from './utils';
 
@@ -23,6 +24,7 @@ interface DatabaseSchema {
   positions: Position[];
   trades: Trade[];
   rebuy_states: Record<string, RebuyState>;
+  learning_records: Record<string, LearningRecord>;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -60,7 +62,8 @@ const INITIAL_DB: DatabaseSchema = {
   token_observations: [],
   positions: [],
   trades: [],
-  rebuy_states: {}
+  rebuy_states: {},
+  learning_records: {}
 };
 
 export class Database {
@@ -211,6 +214,15 @@ export class Database {
       }
     }
 
+    const learning_records: Record<string, LearningRecord> = {};
+    if (data?.learning_records && typeof data.learning_records === 'object') {
+      for (const [id, rec] of Object.entries(data.learning_records)) {
+        if (rec && typeof rec === 'object' && (rec as any).tradeId && isValidSolanaMint((rec as any).mint)) {
+          learning_records[id] = rec as LearningRecord;
+        }
+      }
+    }
+
     return {
       settings,
       trader_wallets,
@@ -218,7 +230,8 @@ export class Database {
       token_observations,
       positions,
       trades,
-      rebuy_states
+      rebuy_states,
+      learning_records
     };
   }
 
@@ -483,6 +496,37 @@ export class Database {
 
   public resetGuardAndHistory(): { completedTrades: number; rebuyGuardEntries: number; resetAt: string } {
     return this.resetRebuyStatesAndHistory();
+  }
+
+  // --- Learning Records ---
+  public getLearningRecords(): Record<string, LearningRecord> {
+    return { ...this.read().learning_records };
+  }
+
+  public getLearningRecord(tradeId: string): LearningRecord | undefined {
+    return this.read().learning_records[tradeId];
+  }
+
+  public addLearningRecord(record: LearningRecord): LearningRecord {
+    if (!isValidSolanaMint(record.mint)) {
+      throw new Error('Invalid token mint for LearningRecord.');
+    }
+    const current = this.read();
+    current.learning_records[record.tradeId] = record;
+    this.save();
+    return { ...record };
+  }
+
+  public resetLearningRecords(): { recordsCleared: number; resetAt: string } {
+    const current = this.read();
+    const recordsCleared = Object.keys(current.learning_records).length;
+    const now = new Date().toISOString();
+    current.learning_records = {};
+    this.save();
+    return {
+      recordsCleared,
+      resetAt: now
+    };
   }
 
   public resetRebuyStatesAndHistory(): { completedTrades: number; rebuyGuardEntries: number; resetAt: string } {

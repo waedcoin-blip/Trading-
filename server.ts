@@ -27,6 +27,7 @@ import {
 } from './src/types.js';
 import { livePriceService, LivePrice } from './src/server/priceService.js';
 import { jupiterService } from './src/server/jupiterService.js';
+import { aiLearningEngine } from './src/server/aiLearningEngine.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
 const appDir = typeof __dirname !== 'undefined'
@@ -57,7 +58,8 @@ function getSanitizedState() {
     trades: db.getTrades(),
     connection: currentConnectionStatus,
     aiStats: db.getAIStats(),
-    rebuyStates: db.getRebuyStates()
+    rebuyStates: db.getRebuyStates(),
+    aiLearningSummary: aiLearningEngine.getSummary()
   };
 }
 
@@ -109,6 +111,47 @@ app.get('/api/rugcheck/:mint', async (req, res) => {
   const report = await getRugCheckReport(mint);
   const validation = validateRugCheck(report, settings);
   res.json({ report, validation });
+});
+
+// --- API: AI Learning Engine Endpoints ---
+app.get('/api/ai/learning', (req, res) => {
+  res.json(aiLearningEngine.getSummary());
+});
+
+app.get('/api/ai/learning/patterns', (req, res) => {
+  res.json({
+    winningPatterns: aiLearningEngine.getTopWinningPatterns(),
+    losingPatterns: aiLearningEngine.getTopLosingPatterns()
+  });
+});
+
+app.get('/api/ai/learning/traders', (req, res) => {
+  res.json({ traders: aiLearningEngine.getTraderIntelligence() });
+});
+
+app.get('/api/ai/learning/performance', (req, res) => {
+  res.json(aiLearningEngine.getAIPerformanceMetrics());
+});
+
+app.get('/api/ai/learning/score/:mint', async (req, res) => {
+  const { mint } = req.params;
+  const observations = db.getTokenObservations();
+  const obs = observations.find(o => o.token_mint === mint);
+  if (!obs) {
+    return res.status(404).json({ success: false, error: 'Token observation not found' });
+  }
+  const evalResult = await scoreToken(obs, db.getTrades());
+  res.json(evalResult);
+});
+
+app.post('/api/ai/learning/reset', (req, res) => {
+  try {
+    const result = aiLearningEngine.resetLearning();
+    broadcastState();
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Failed to reset AI learning' });
+  }
 });
 
 // API: Reset Profitable-Only Rebuy Guard Matrix and Completed Trade History
@@ -216,6 +259,15 @@ app.post('/api/action', async (req, res) => {
         success: true,
         completedTrades: result.completedTrades,
         rebuyGuardEntries: result.rebuyGuardEntries,
+        resetAt: result.resetAt
+      });
+    }
+    else if (actionType === 'RESET_AI_LEARNING') {
+      const result = aiLearningEngine.resetLearning();
+      broadcastState();
+      res.json({
+        success: true,
+        recordsCleared: result.recordsCleared,
         resetAt: result.resetAt
       });
     }
@@ -1027,7 +1079,7 @@ async function executePartialSell(
   });
 
   // Log trade entry for the partial sell
-  db.addTrade({
+  const partialTrade = db.addTrade({
     position_id: pos.id,
     token_mint: pos.token_mint,
     token_name: pos.token_name,
@@ -1052,6 +1104,9 @@ async function executePartialSell(
     sell_reason: triggerReason,
     mode: settings.trading_mode
   });
+
+  // Learn from completed partial trade
+  aiLearningEngine.learnFromCompletedTrade(partialTrade, pos);
 
   console.log(`[Partial Sell] Sold ${formatTokenQuantity(tokensToSellNum, decimals)} of ${pos.token_symbol}. Remaining: ${remainingFormatted} tokens.`);
   broadcastState();
@@ -1141,7 +1196,7 @@ async function executePositionExit(
   db.updateSettings({ paper_balance_sol: updatedBalance });
 
   // Record trade history
-  db.addTrade({
+  const completedTrade = db.addTrade({
     position_id: pos.id,
     token_mint: pos.token_mint,
     token_name: pos.token_name,
@@ -1166,6 +1221,9 @@ async function executePositionExit(
     sell_reason: reason,
     mode: settings.trading_mode
   });
+
+  // Learn from completed trade in AI Learning Engine
+  aiLearningEngine.learnFromCompletedTrade(completedTrade, pos);
 
   // Centralized RebuyGuard update: records realized PnL and decides future rebuy eligibility
   await RebuyGuard.onPositionExited({
