@@ -20,6 +20,7 @@ import SettingsPage from './components/SettingsPage';
 export default function App() {
   const [activeTab, setActiveTab] = useState<'watchlist' | 'trading' | 'settings'>('watchlist');
   const [state, setState] = useState<ServerState | null>(null);
+  const [backendOnline, setBackendOnline] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [wsError, setWsError] = useState(false);
   
@@ -32,6 +33,7 @@ export default function App() {
     try {
       const res = await fetch('/api/state');
       if (res.ok) {
+        setBackendOnline(true);
         const data = await res.json();
         setState(prevState => {
           if (!prevState) return data;
@@ -61,9 +63,11 @@ export default function App() {
             positions: mergedPositions
           };
         });
+      } else {
+        setBackendOnline(false);
       }
     } catch (err) {
-      // Handle transient fetch errors gracefully while server starts up or connects
+      setBackendOnline(false);
       console.warn('[HTTP] State sync pending server readiness...');
     }
   };
@@ -227,13 +231,25 @@ export default function App() {
           <div>
             <div className="flex items-center gap-2">
               <h1 className="font-extrabold text-sm md:text-md text-white tracking-wide">ULTRA TRADING BOT</h1>
+              
+              {/* Backend Status */}
+              <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-extrabold ${
+                backendOnline 
+                  ? 'bg-emerald-500/10 text-[#34d399] border border-emerald-500/20' 
+                  : 'bg-red-500/10 text-[#f87171] border border-red-500/20 animate-pulse'
+              }`} title="Backend Express API Server Status">
+                <span className={`w-1 h-1 rounded-full ${backendOnline ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                {backendOnline ? 'BACKEND: ONLINE' : 'BACKEND: OFFLINE'}
+              </span>
+
+              {/* Realtime WS Stream Status */}
               <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-extrabold ${
                 wsConnected 
-                  ? 'bg-emerald-500/10 text-[#34d399]' 
-                  : 'bg-red-500/10 text-[#f87171] animate-pulse'
-              }`}>
-                <span className={`w-1 h-1 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
-                {wsConnected ? 'ONLINE' : 'OFFLINE'}
+                  ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' 
+                  : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+              }`} title="Real-time WebSocket Push Stream Status">
+                <span className={`w-1 h-1 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-amber-500'}`} />
+                {wsConnected ? 'STREAM: LIVE' : 'STREAM: POLLING'}
               </span>
             </div>
             <p className="text-[10px] text-[#6b7280]">Production-grade Solana trader-wallet copy terminal</p>

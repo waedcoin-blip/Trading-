@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'http';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { fileURLToPath } from 'url';
@@ -26,12 +27,14 @@ import {
 } from './src/types.js';
 import { livePriceService, LivePrice } from './src/server/priceService.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Environment-resilient directory resolution for CJS and ESM execution
+const appDir = typeof __dirname !== 'undefined'
+  ? __dirname
+  : (import.meta && import.meta.url ? path.dirname(fileURLToPath(import.meta.url)) : process.cwd());
 
 const app = express();
 const server = http.createServer(app);
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 
@@ -58,9 +61,9 @@ function getSanitizedState() {
   };
 }
 
-// API: Health endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+// API: Health endpoint for Render & local health checks
+app.get(['/health', '/api/health'], (req, res) => {
+  res.json({ ok: true, status: 'online' });
 });
 
 // API: Get current state
@@ -1286,7 +1289,11 @@ wss.on('connection', (ws) => {
 async function startServer() {
   // Vite dev mode integration or production static serving
   if (process.env.NODE_ENV === 'production') {
-    const distPath = path.join(__dirname, 'dist');
+    const distPath = fs.existsSync(path.join(appDir, 'index.html'))
+      ? appDir
+      : path.join(process.cwd(), 'dist');
+
+    console.log(`[Production] Serving static frontend SPA assets from: ${distPath}`);
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
