@@ -10,7 +10,8 @@ import {
   Trade, 
   AIStats,
   RebuyState,
-  LearningRecord
+  LearningRecord,
+  BuyAuthorizationAudit
 } from './types';
 import { isValidSolanaMint, formatTokenQuantity } from './utils';
 
@@ -25,6 +26,7 @@ interface DatabaseSchema {
   trades: Trade[];
   rebuy_states: Record<string, RebuyState>;
   learning_records: Record<string, LearningRecord>;
+  buy_authorization_audits: BuyAuthorizationAudit[];
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -74,7 +76,8 @@ const INITIAL_DB: DatabaseSchema = {
   positions: [],
   trades: [],
   rebuy_states: {},
-  learning_records: {}
+  learning_records: {},
+  buy_authorization_audits: []
 };
 
 export class Database {
@@ -246,6 +249,10 @@ export class Database {
       }
     }
 
+    const buy_authorization_audits = Array.isArray(data?.buy_authorization_audits)
+      ? data.buy_authorization_audits
+      : [];
+
     return {
       settings,
       trader_wallets,
@@ -254,7 +261,8 @@ export class Database {
       positions,
       trades,
       rebuy_states,
-      learning_records
+      learning_records,
+      buy_authorization_audits
     };
   }
 
@@ -419,19 +427,78 @@ export class Database {
     }
 
     const current = this.read();
-    const newObs: TokenObservation = {
-      ...obs,
-      id: 'obs_' + Math.random().toString(36).substring(2, 11),
-      timestamp: new Date().toISOString()
+    const normalizedMint = obs.token_mint.trim();
+    
+    // Case-safe normalized search for uniqueness
+    const existingIdx = current.token_observations.findIndex(
+      t => t.token_mint.trim().toLowerCase() === normalizedMint.toLowerCase()
+    );
+
+    const now = new Date().toISOString();
+
+    if (existingIdx !== -1) {
+      // Merge properties, preserving original identity while updating latest statistics
+      const existing = current.token_observations[existingIdx];
+      const mergedObs: TokenObservation = {
+        ...existing,
+        ...obs,
+        token_mint: normalizedMint, // Ensure normalized
+        timestamp: now // Update timestamp to reflect newest activity
+      };
+      
+      // Move to top of the feed list
+      current.token_observations.splice(existingIdx, 1);
+      current.token_observations.unshift(mergedObs);
+      this.save();
+      return mergedObs;
+    } else {
+      // Add as a new unique observation
+      const newObs: TokenObservation = {
+        ...obs,
+        token_mint: normalizedMint,
+        id: 'obs_' + Math.random().toString(36).substring(2, 11),
+        timestamp: now
+      };
+      
+      current.token_observations.unshift(newObs);
+      
+      // Keep last 100 observations to protect memory limits
+      if (current.token_observations.length > 100) {
+        current.token_observations = current.token_observations.slice(0, 100);
+      }
+      this.save();
+      return newObs;
+    }
+  }
+
+  // --- Buy Authorization Audits ---
+  public getBuyAuthorizationAudits(): BuyAuthorizationAudit[] {
+    const db = this.read();
+    if (!db.buy_authorization_audits) {
+      db.buy_authorization_audits = [];
+    }
+    return [...db.buy_authorization_audits];
+  }
+
+  public addBuyAuthorizationAudit(audit: Omit<BuyAuthorizationAudit, 'id' | 'createdAt'>): BuyAuthorizationAudit {
+    const db = this.read();
+    if (!db.buy_authorization_audits) {
+      db.buy_authorization_audits = [];
+    }
+
+    const newAudit: BuyAuthorizationAudit = {
+      ...audit,
+      id: 'audit_' + Math.random().toString(36).substring(2, 11),
+      createdAt: new Date().toISOString()
     };
 
-    current.token_observations.unshift(newObs);
-    // Keep last 100
-    if (current.token_observations.length > 100) {
-      current.token_observations = current.token_observations.slice(0, 100);
+    db.buy_authorization_audits.unshift(newAudit);
+    // Keep last 100 entries
+    if (db.buy_authorization_audits.length > 100) {
+      db.buy_authorization_audits = db.buy_authorization_audits.slice(0, 100);
     }
     this.save();
-    return newObs;
+    return newAudit;
   }
 
   // --- Positions ---

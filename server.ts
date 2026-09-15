@@ -10,6 +10,10 @@ import { db } from './src/db.js';
 import { scoreToken } from './src/server/ai.js';
 import { RebuyGuard } from './src/server/rebuyGuard.js';
 import { getRugCheckReport, validateRugCheck } from './src/server/rugcheck.js';
+import { BuyAuthorizationService } from './src/server/buyAuthorization.js';
+import { MomentumService } from './src/server/momentumService.js';
+import { PaperExecutionService } from './src/server/paperExecutionService.js';
+import { UnifiedExitService } from './src/server/unifiedExitService.js';
 import { 
   isValidSolanaMint, 
   isValidSolanaSignature, 
@@ -59,7 +63,8 @@ function getSanitizedState() {
     connection: currentConnectionStatus,
     aiStats: db.getAIStats(),
     rebuyStates: db.getRebuyStates(),
-    aiLearningSummary: aiLearningEngine.getSummary()
+    aiLearningSummary: aiLearningEngine.getSummary(),
+    buy_authorization_audits: db.getBuyAuthorizationAudits()
   };
 }
 
@@ -225,7 +230,9 @@ app.post('/api/action', async (req, res) => {
       const positions = db.getPositions();
       const pos = positions.find(p => p.id === data.id);
       if (pos) {
-        await executePositionExit(pos, pos.current_price, pos.current_value_sol, pos.unrealized_pnl_sol, pos.unrealized_pnl_percent, 'MANUAL');
+        await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+          broadcastState();
+        });
       }
       res.json({ success: true });
     }
@@ -548,6 +555,9 @@ async function processDetectedTransaction(signature: string, trader: TraderWalle
       timestamp: new Date(blockTime * 1000).toISOString()
     });
 
+    // Record in rolling MomentumService for unique buyers/10s calculations
+    MomentumService.getInstance().recordTransaction(targetMint, 'BUY', signature, solSpent);
+
     // Run DexScreener metrics gate, filters, AI scoring, and copy-trading execution
     await evaluateAndCopyToken(targetMint, targetDecimals, trader, {
       signature,
@@ -619,11 +629,6 @@ async function evaluateAndCopyToken(
         liquidity = pair.liquidity?.usd ? Number(pair.liquidity.usd) : 'UNKNOWN';
         volume24h = pair.volume?.h24 ? Number(pair.volume.h24) : 'UNKNOWN';
 
-        // Derive 10s rolling buyer count from DexScreener 5m buy transaction velocity (300s / 30 = 10s)
-        if (pair.txns?.m5?.buys !== undefined) {
-          buyers10s = Math.round(Number(pair.txns.m5.buys) / 30);
-        }
-
         // Check on-chain dev holding / authority
         developerHoldingPercent = await getOnChainDevHolding(mint);
       }
@@ -650,7 +655,7 @@ async function evaluateAndCopyToken(
       liquidity: liquidity,
       volume_24h: volume24h,
       developer_holding_percent: developerHoldingPercent,
-      buyers_10s: buyers10s,
+      buyers_10s: 0,
       price: price,
       status: 'REJECT',
       rejection_reason: 'Required market metrics unavailable on DexScreener',
@@ -660,74 +665,59 @@ async function evaluateAndCopyToken(
     return;
   }
 
-  // Evaluate RebuyGuard for this token mint
-  const rebuyDecision = await RebuyGuard.canBuy(mint);
-  if (!rebuyDecision.allowed) {
-    console.log(`[RebuyGuard] Automated BUY blocked for ${tokenSymbol} (${mint}). Reason: ${rebuyDecision.reason}`);
-    db.addTokenObservation({
-      token_mint: mint,
-      token_name: tokenName,
-      token_symbol: tokenSymbol,
-      market_cap: marketCap,
-      liquidity: liquidity,
-      volume_24h: volume24h,
-      developer_holding_percent: developerHoldingPercent,
-      buyers_10s: buyers10s,
-      price: price,
-      status: 'REJECT',
-      rejection_reason: `RebuyGuard: ${rebuyDecision.reason}`,
-      source_trader_name: trader.name
-    });
-    broadcastState();
-    return;
-  }
-
-  // Apply strict requirement checks:
-  let rejectionReason = '';
-  const settings = db.getSettings();
-  
-  // Requirement 1: Market Cap > $4,000. Reject <= $4,000
-  if (marketCap <= 4000) {
-    rejectionReason = `Market Cap ($${marketCap.toLocaleString()}) is <= $4,000`;
-  }
-  // Requirement 2: Liquidity > $4,000. Reject <= $4,000
-  else if (liquidity <= 4000) {
-    rejectionReason = `Liquidity ($${liquidity.toLocaleString()}) is <= $4,000`;
-  }
-  // Requirement 3: Developer Holding < 5%. Reject >= 5% (if known)
-  else if (developerHoldingPercent !== 'UNKNOWN' && developerHoldingPercent >= 5) {
-    rejectionReason = `Developer holding (${developerHoldingPercent}%) is >= 5%`;
-  }
-  // Requirement 4: 24h Volume > $5,000. Reject <= $5,000
-  else if (volume24h <= 5000) {
-    rejectionReason = `24h Volume ($${volume24h.toLocaleString()}) is <= $5,000`;
-  }
-  // Requirement 5: Unique buyers in rolling 10-second window > 10. Reject <= 10 (if known)
-  else if (buyers10s !== 'UNKNOWN' && buyers10s <= 10) {
-    rejectionReason = `Rolling 10s buyers (${buyers10s}) is <= 10`;
-  }
-
-  // Mandatory Security Gate: RugCheck Security Verification (Runs before AI & before BUY)
-  let rugCheck = undefined;
+  // Mandatory RugCheck Security Check
+  let rugCheck = await getRugCheckReport(mint);
   let rugCheckPassed = false;
-  if (!rejectionReason && settings.enableRugCheck) {
-    console.log(`[RugCheck] Running security verification for ${tokenSymbol} (${mint})...`);
-    rugCheck = await getRugCheckReport(mint);
+  const settings = db.getSettings();
+  if (settings.enableRugCheck) {
     const rugValidation = validateRugCheck(rugCheck, settings);
-
-    if (!rugValidation.passed) {
-      rejectionReason = rugValidation.reason || 'RugCheck Security Filter Failed';
-      rugCheckPassed = false;
-      console.warn(`[RugCheck] REJECTED: Token ${tokenSymbol} (${mint}) failed security validation. Reason: ${rejectionReason}`);
-    } else {
-      rugCheckPassed = true;
-      console.log(`[RugCheck] PASSED: Token ${tokenSymbol} (${mint}) verified safe. Risk Level: ${rugCheck.riskLevel}`);
-    }
+    rugCheckPassed = rugValidation.passed;
+  } else {
+    rugCheckPassed = true;
   }
 
-  // AI scoring gate: runs AFTER base filters & RugCheck pass, BEFORE final eligibility decision
+  // Construct TradeCandidate
+  const candidate = {
+    tokenMint: mint,
+    tokenName,
+    tokenSymbol,
+    traderWallet: trader.wallet_address,
+    sourceSignature: buyDetails.signature,
+    detectedAt: new Date().toISOString(),
+    market: {
+      tokenMint: mint,
+      priceUSD: price,
+      priceSOL: cachedSolUsdPrice > 0 ? price / cachedSolUsdPrice : 0,
+      marketCapUSD: marketCap,
+      liquidityUSD: liquidity,
+      volumeUSD24h: volume24h,
+      timestamp: new Date().toISOString(),
+      source: 'DexScreener'
+    },
+    security: {
+      developerHoldingPct: typeof developerHoldingPercent === 'number' ? developerHoldingPercent : 0,
+      mintAuthority: rugCheck?.mintAuthority || null,
+      freezeAuthority: rugCheck?.freezeAuthority || null,
+      lpLocked: rugCheck?.lpLocked || false,
+      rugcheckPassed: rugCheckPassed,
+      status: rugCheck?.riskLevel || 'Unknown'
+    },
+    trader: {
+      walletAddress: trader.wallet_address,
+      name: trader.name,
+      signals: 0,
+      paperTrades: 0,
+      winRate: 0,
+      pnlSol: 0
+    }
+  };
+
+  // Evaluate using Deterministic BuyAuthorizationService
+  const decision = await BuyAuthorizationService.getInstance(db).evaluate(candidate);
+
+  // Run AI scoring gate for extra stats enrichment (does not bypass filters)
   let aiResult: { score: number; confidence?: number; signals: { positive: string[]; risks: string[] } } | null = null;
-  if (!rejectionReason) {
+  try {
     const previousTrades = db.getTrades();
     aiResult = await scoreToken({
       token_mint: mint,
@@ -737,23 +727,18 @@ async function evaluateAndCopyToken(
       liquidity: liquidity,
       volume_24h: volume24h,
       developer_holding_percent: developerHoldingPercent,
-      buyers_10s: buyers10s,
+      buyers_10s: decision.criteria.buyTxCount10s,
       price: price,
       status: 'WAIT'
     }, previousTrades);
-
-    const minScore = settings.min_ai_score_to_buy ?? 55;
-    if (aiResult.score < minScore) {
-      rejectionReason = `AI Score (${aiResult.score}) below minimum entry threshold (${minScore})`;
-    }
+  } catch (err) {
+    console.error('[Filters] AI scoring errored:', err);
   }
 
-  const isEligible = rejectionReason === '';
+  const isEligible = decision.decision === 'AUTHORIZED';
   const status = isEligible ? 'ELIGIBLE' : 'REJECT';
 
-  console.log(`[Filters] Evaluation completed for ${tokenSymbol} (${mint}). Status: ${status}.${aiResult ? ` AI Score: ${aiResult.score}` : ''}${rejectionReason ? ` Reason: ${rejectionReason}` : ''}`);
-
-  // Persist observation (store ai_score/ai_signals whenever scoring ran)
+  // Persist observation (safely upserting via normalized mint address)
   db.addTokenObservation({
     token_mint: mint,
     token_name: tokenName,
@@ -762,39 +747,33 @@ async function evaluateAndCopyToken(
     liquidity: liquidity,
     volume_24h: volume24h,
     developer_holding_percent: developerHoldingPercent,
-    buyers_10s: buyers10s,
+    buyers_10s: decision.criteria.buyTxCount10s,
     price: price,
     status,
-    rejection_reason: rejectionReason || undefined,
+    rejection_reason: decision.rejectReasons.join(', ') || undefined,
     source_trader_name: trader.name,
     ai_score: aiResult ? aiResult.score : undefined,
     ai_signals: aiResult ? aiResult.signals : undefined,
     rugcheck: rugCheck,
-    rugcheck_passed: rugCheck ? rugCheckPassed : undefined
+    rugcheck_passed: rugCheckPassed
   });
 
-  // If eligible, execute trade entry in background
-  if (isEligible && aiResult) {
+  // If eligible, execute trade entry using our modular paper execution engine
+  if (isEligible) {
     if (settings.trading_mode === 'PAPER') {
-      await executePaperBuy({
+      const priceSol = cachedSolUsdPrice > 0 ? price / cachedSolUsdPrice : 0.000001;
+      PaperExecutionService.getInstance(db).executeBuy(
         mint,
-        decimals,
         tokenName,
         tokenSymbol,
-        trader,
-        buySignature: buyDetails.signature,
-        aiScore: aiResult.score,
-        aiConfidence: aiResult.confidence ?? 65,
-        aiSignals: aiResult.signals,
-        marketCap,
-        liquidity,
-        volume24h,
-        buyers10s,
-        priceUsd: price,
-        rugcheck: rugCheck
-      });
+        decimals,
+        priceSol,
+        trader.id,
+        trader.name,
+        buyDetails.signature
+      );
     } else {
-      console.warn(`[Mainnet] Copy trading on MAINNET mode requested. Mainnet requires explicit manual transaction signing.`);
+      console.warn(`[Mainnet] Copy trading on MAINNET mode requested. Mainnet is currently a dry-run / paper system.`);
     }
   }
 
@@ -993,44 +972,25 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
   if (activePositions.length === 0) return;
 
   const solUsdRate = livePriceService.getSolUsdPrice();
-  const settings = db.getSettings();
 
   for (const pos of activePositions) {
     if (exitingPositions.has(pos.id)) continue;
 
-    const remainingTokens = parseTokenQuantity(pos.remainingTokenQuantity || pos.tokenQuantity || String(pos.token_amount));
-    const currentValueSol = Number((remainingTokens * livePrice.priceSol).toFixed(4));
-    const pnlSol = Number((currentValueSol - pos.sol_in).toFixed(4));
-    const pnlPercent = pos.sol_in > 0 ? Number(((pnlSol / pos.sol_in) * 100).toFixed(2)) : 0;
-
-    const currentPriceUsdFormatted = `$${livePrice.priceUsd < 0.01 ? livePrice.priceUsd.toFixed(8) : livePrice.priceUsd.toFixed(4)}`;
-    const currentValueUsdFormatted = `$${(currentValueSol * solUsdRate).toFixed(2)}`;
-
-    // Calculate peak PnL, peak price, and trailing stop armed status
-    const currentPeakPnl = Math.max(pos.peak_pnl_percent ?? 0, pnlPercent);
-    const currentPeakPrice = Math.max(pos.peak_price ?? pos.entry_price, livePrice.priceSol);
-
-    const trailingStopActivation = settings.trailing_stop_activation_percent ?? 15;
-    const trailingStopDist = settings.trailing_stop_percent ?? 10;
-    const isTrailingArmed = Boolean(
-      pos.trailing_stop_armed ||
-      (settings.enable_trailing_stop && currentPeakPnl >= trailingStopActivation)
+    // 1. Let UnifiedExitService evaluate triggers and execute exits
+    UnifiedExitService.getInstance(db).evaluateExitTriggers(
+      pos,
+      livePrice.priceSol,
+      livePrice.isStale,
+      (exitedPos, completedTrade, reason) => {
+        // Callback when an exit is successfully executed
+        console.log(`[Exit Engine] Broadcast state post-exit for ${exitedPos.token_symbol}. Reason: ${reason}`);
+        broadcastState();
+      }
     );
 
-    // Update active position metrics in DB
-    db.updatePosition(pos.id, {
-      current_price: livePrice.priceSol,
-      currentPrice: `${livePrice.priceSol.toFixed(10)} SOL (${currentPriceUsdFormatted})`,
-      current_value_sol: currentValueSol,
-      currentValue: `${currentValueSol.toFixed(4)} SOL (${currentValueUsdFormatted})`,
-      unrealized_pnl_sol: pnlSol,
-      unrealizedPnl: `${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
-      unrealized_pnl_percent: pnlPercent,
-      unrealizedPnlPercent: `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`,
-      peak_pnl_percent: currentPeakPnl,
-      peak_price: currentPeakPrice,
-      trailing_stop_armed: isTrailingArmed
-    });
+    // 2. Fetch updated state for live broadcasting
+    const updatedPos = db.getPositions().find(p => p.id === pos.id);
+    if (!updatedPos || updatedPos.status !== 'ACTIVE') continue;
 
     // Broadcast targeted POSITION_PNL_UPDATE for instant UI update
     const pnlPayload = JSON.stringify({
@@ -1038,9 +998,9 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
       data: {
         positionId: pos.id,
         mint: pos.token_mint,
-        pnlSol,
-        pnlPercent,
-        currentValueSol,
+        pnlSol: updatedPos.unrealized_pnl_sol,
+        pnlPercent: updatedPos.unrealized_pnl_percent,
+        currentValueSol: updatedPos.current_value_sol,
         currentPriceSol: livePrice.priceSol,
         currentPriceUsd: livePrice.priceUsd,
         solUsdRate,
@@ -1055,46 +1015,6 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
         client.send(pnlPayload);
       }
     }
-
-    // Evaluate Take Profit / Stop Loss / Trailing Stop / Stagnant Exit triggers (Skip if price is stale)
-    if (!livePrice.isStale) {
-      let triggerReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | null = null;
-
-      // 1. Take Profit
-      if (pnlPercent >= pos.take_profit_percent) {
-        triggerReason = 'TAKE_PROFIT';
-      }
-      // 2. Stop Loss
-      else if (pnlPercent <= -pos.stop_loss_percent) {
-        triggerReason = 'STOP_LOSS';
-      }
-      // 3. Trailing Stop
-      else if (
-        settings.enable_trailing_stop &&
-        isTrailingArmed &&
-        (currentPeakPnl - pnlPercent) >= trailingStopDist
-      ) {
-        triggerReason = 'TRAILING_STOP';
-      }
-      // 4. Time / Stagnant Exit
-      else if (settings.enable_time_exit) {
-        const holdDurationMs = Date.now() - new Date(pos.buy_time).getTime();
-        const maxHoldMs = (settings.max_hold_minutes ?? 30) * 60 * 1000;
-        const stagnantThresh = settings.stagnant_pnl_threshold_percent ?? 5;
-        if (holdDurationMs >= maxHoldMs && Math.abs(pnlPercent) < stagnantThresh) {
-          triggerReason = 'STAGNANT';
-        }
-      }
-
-      if (triggerReason) {
-        exitingPositions.add(pos.id);
-        executePositionExit(pos, livePrice.priceSol, currentValueSol, pnlSol, pnlPercent, triggerReason)
-          .catch(err => console.error(`[Exit Engine] Trigger exit failed for position ${pos.id}:`, err))
-          .finally(() => exitingPositions.delete(pos.id));
-      }
-    } else {
-      console.warn(`[Exit Engine] Price for ${pos.token_symbol} is STALE (${Date.now() - livePrice.updatedAt}ms). Automatic exit execution skipped.`);
-    }
   }
 }
 
@@ -1106,7 +1026,9 @@ async function executePartialSell(
 ) {
   if (sellRatio >= 1) {
     // 100% full exit
-    await executePositionExit(pos, pos.current_price, pos.current_value_sol, pos.unrealized_pnl_sol, pos.unrealized_pnl_percent, 'MANUAL');
+    await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+      broadcastState();
+    });
     return;
   }
 
@@ -1117,7 +1039,9 @@ async function executePartialSell(
   const newRemainingNum = Math.max(0, Number((currentRemainingNum - tokensToSellNum).toFixed(decimals)));
 
   if (newRemainingNum <= 0) {
-    await executePositionExit(pos, pos.current_price, pos.current_value_sol, pos.unrealized_pnl_sol, pos.unrealized_pnl_percent, 'MANUAL');
+    await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+      broadcastState();
+    });
     return;
   }
 
@@ -1238,75 +1162,6 @@ async function reconcilePositionWithOnChainBalance(pos: Position): Promise<{ mat
   return { matched: true, message: 'On-chain balance matches recorded position' };
 }
 
-// Execute 100% full position exit
-async function executePositionExit(
-  pos: Position, 
-  exitPrice: number, 
-  solOut: number, 
-  pnlSol: number, 
-  pnlPercent: number, 
-  reason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | 'MANUAL' | 'ERROR_RECOVERY'
-) {
-  console.log(`[Exit Engine] TRIGGERED: Selling 100% of ${pos.token_symbol} (${pos.token_mint}). Reason: ${reason}. PnL: ${pnlPercent}%`);
-
-  const decimals = typeof pos.tokenDecimals === 'number' ? pos.tokenDecimals : (pos.token_decimals || 6);
-  const remainingNum = parseTokenQuantity(pos.remainingTokenQuantity || pos.tokenQuantity);
-
-  // Move position to COMPLETED status and delete from active list
-  db.updatePosition(pos.id, { status: 'SOLD', remainingTokenQuantity: '0', remainingQuantity: '0' });
-  db.deletePosition(pos.id); // Remove from active list
-
-  const settings = db.getSettings();
-
-  // Restore paper balance with output SOL
-  const updatedBalance = Number((settings.paper_balance_sol + solOut).toFixed(4));
-  db.updateSettings({ paper_balance_sol: updatedBalance });
-
-  // Record trade history
-  const completedTrade = db.addTrade({
-    position_id: pos.id,
-    token_mint: pos.token_mint,
-    token_name: pos.token_name,
-    token_symbol: pos.token_symbol,
-    source_trader_id: pos.source_trader_id,
-    source_trader_name: pos.source_trader_name,
-    buy_signature: pos.buy_signature,
-    sell_signature: pos.buy_signature + '_exit',
-    sol_in: pos.sol_in,
-    token_amount_bought: parseTokenQuantity(pos.tokenQuantity),
-    tokenQuantityBought: pos.tokenQuantity,
-    token_amount_sold: remainingNum,
-    tokenQuantitySold: formatTokenQuantity(remainingNum, decimals),
-    remainingQuantity: '0',
-    sol_out: solOut,
-    entry_price: pos.entry_price,
-    exit_price: exitPrice,
-    buy_time: pos.buy_time,
-    sell_time: new Date().toISOString(),
-    pnl_sol: pnlSol,
-    pnl_percent: pnlPercent,
-    sell_reason: reason,
-    mode: settings.trading_mode
-  });
-
-  // Learn from completed trade in AI Learning Engine
-  aiLearningEngine.learnFromCompletedTrade(completedTrade, pos);
-
-  // Centralized RebuyGuard update: records realized PnL and decides future rebuy eligibility
-  await RebuyGuard.onPositionExited({
-    mint: pos.token_mint,
-    positionId: pos.id,
-    tokenQuantity: pos.tokenQuantity,
-    entryPrice: pos.entry_price,
-    exitPrice,
-    entryCost: pos.sol_in,
-    exitProceeds: solOut,
-    fees: 0,
-    sellReason: reason
-  });
-
-  console.log(`[Exit Engine] SELL SUCCESS: Logged completed trade for ${pos.token_symbol}. Received ${solOut} SOL.`);
-}
 
 // Event-Driven Live Price Monitoring Engine:
 // High-frequency live pricing (1-1.5s interval) via Jupiter batch API primary with DexScreener fallback.
@@ -1385,7 +1240,9 @@ wss.on('connection', (ws) => {
         const positions = db.getPositions();
         const pos = positions.find(p => p.id === data.id);
         if (pos) {
-          await executePositionExit(pos, pos.current_price, pos.current_value_sol, pos.unrealized_pnl_sol, pos.unrealized_pnl_percent, 'MANUAL');
+          await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+            broadcastState();
+          });
         }
       }
 

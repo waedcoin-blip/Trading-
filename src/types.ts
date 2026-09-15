@@ -450,4 +450,128 @@ export interface ServerState {
   aiStats: AIStats;
   rebuyStates: Record<string, RebuyState>;
   aiLearningSummary?: AILearningSummary;
+  buy_authorization_audits?: BuyAuthorizationAudit[];
+}
+
+export type DecisionStatus = 'AUTHORIZED' | 'REJECTED' | 'PENDING';
+
+export interface CriteriaResult {
+  marketCapUSD: number;
+  liquidityUSD: number;
+  volumeUSD: number;
+  developerHoldingPct: number;
+  buyTxCount10s: number;
+  marketCapPassed: boolean;
+  liquidityPassed: boolean;
+  volumePassed: boolean;
+  developerPassed: boolean;
+  buyVelocityPassed: boolean;
+  passed: boolean;
+}
+
+export interface SafetyResult {
+  rugcheckScore: number;
+  rugcheckPassed: boolean;
+  mintAuthorityRemoved: boolean;
+  freezeAuthorityRemoved: boolean;
+  lpLocked: boolean;
+  passed: boolean;
+  rejectionReason?: string;
+}
+
+export interface MomentumResult {
+  buyTxCount5s: number;
+  buyTxCount10s: number;
+  buyTxCount30s: number;
+  buyTxCount60s: number;
+  sellTxCount10s: number;
+  sellTxCount30s: number;
+  buyVolume10s: number;
+  sellVolume10s: number;
+  priceChange10s: number;
+  priceChange30s: number;
+  priceChange5m: number;
+  buyAcceleration: number;
+}
+
+export interface ExecutionResult {
+  quoteTimestamp: number;
+  inputAmount: number;
+  expectedOutput: number;
+  route: string;
+  priceImpact: number;
+  slippage: number;
+  passed: boolean;
+  rejectionReason?: string;
+}
+
+export interface BuyDecision {
+  decision: DecisionStatus;
+  candidateId: string;
+  tokenMint: string;
+  traderWallet: string;
+  authorizedAt: string;
+  criteria: CriteriaResult;
+  safety: SafetyResult;
+  momentum: MomentumResult;
+  execution?: ExecutionResult;
+  rejectReasons: string[];
+  auditId: string;
+  strategyVersion: string;
+}
+
+export interface TradeCandidate {
+  id: string;
+  tokenMint: string;
+  tokenName: string;
+  tokenSymbol: string;
+  traderWallet: string;
+  sourceSignature: string;
+  detectedAt: string;
+  market: {
+    tokenMint: string;
+    priceUSD: number;
+    priceSOL: number;
+    marketCapUSD: number;
+    liquidityUSD: number;
+    volumeUSD24h: number;
+    timestamp: string;
+    source: string;
+  };
+  security: {
+    developerHoldingPct: number;
+    mintAuthority: string | null;
+    freezeAuthority: string | null;
+    lpLocked: boolean;
+    rugcheckPassed: boolean;
+    status: string;
+  };
+  momentum: MomentumResult;
+  trader: {
+    walletAddress: string;
+    name: string;
+    signals: number;
+    paperTrades: number;
+    winRate: number;
+    pnlSol: number;
+  };
+}
+
+export interface BuyAuthorizationAudit {
+  id: string;
+  candidateId: string;
+  tokenMint: string;
+  tokenName: string;
+  tokenSymbol: string;
+  traderWallet: string;
+  sourceSignature: string;
+  createdAt: string;
+  marketSnapshotJSON: string;
+  securitySnapshotJSON: string;
+  momentumSnapshotJSON: string;
+  traderSnapshotJSON: string;
+  executionSnapshotJSON?: string;
+  decision: string;
+  rejectReasons: string[];
+  strategyVersion: string;
 }
