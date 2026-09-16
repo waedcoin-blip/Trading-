@@ -74,14 +74,29 @@ export class BuyAuthorizationService {
     const rugcheckScore = rugcheckReport.score;
     
     const settingsRugStatusAllowed = settings.requiredRugStatus || ['Good', 'Warn'];
-    const rugcheckPassed = settings.enableRugCheck ? (
-      settingsRugStatusAllowed.includes(rugcheckReport.riskLevel) &&
-      rugcheckReport.score <= (settings.maxRiskScore || 300) &&
-      (!settings.requireMintAuthorityRemoved || mintAuthRemoved) &&
-      (!settings.requireFreezeAuthorityRemoved || freezeAuthRemoved) &&
-      (!settings.requireLpLocked || lpLocked) &&
-      rugcheckReport.topHoldersPct <= (settings.maxHolderConcentration || 25)
-    ) : true;
+    const securityRejectReasons: string[] = [];
+    if (settings.enableRugCheck) {
+      if (!settingsRugStatusAllowed.includes(rugcheckReport.riskLevel)) {
+        securityRejectReasons.push(`RISK_LEVEL_${rugcheckReport.riskLevel.toUpperCase()}`);
+      }
+      if (rugcheckReport.score > (settings.maxRiskScore || 300)) {
+        securityRejectReasons.push(`HIGH_RISK_SCORE_${rugcheckReport.score}`);
+      }
+      if (settings.requireMintAuthorityRemoved && !mintAuthRemoved) {
+        securityRejectReasons.push('MINT_AUTH_NOT_REMOVED');
+      }
+      if (settings.requireFreezeAuthorityRemoved && !freezeAuthRemoved) {
+        securityRejectReasons.push('FREEZE_AUTH_NOT_REMOVED');
+      }
+      if (settings.requireLpLocked && !lpLocked) {
+        securityRejectReasons.push('LP_NOT_LOCKED');
+      }
+      if (rugcheckReport.topHoldersPct > (settings.maxHolderConcentration || 25)) {
+        securityRejectReasons.push('HIGH_HOLDER_CONCENTRATION');
+      }
+    }
+
+    const rugcheckPassed = settings.enableRugCheck ? securityRejectReasons.length === 0 : true;
 
     const safety: SafetyResult = {
       rugcheckScore,
@@ -90,7 +105,7 @@ export class BuyAuthorizationService {
       freezeAuthorityRemoved: freezeAuthRemoved,
       lpLocked,
       passed: rugcheckPassed,
-      rejectionReason: rugcheckPassed ? undefined : rugcheckReport.rejectionReason || 'FAILED_SECURITY_GATE'
+      rejectionReason: rugcheckPassed ? undefined : (securityRejectReasons.join(', ') || 'SECURITY_GATE_FAILED')
     };
 
     // 3. Evaluate Hard Criteria Metrics
@@ -99,13 +114,25 @@ export class BuyAuthorizationService {
     const vol = candidate.market.volumeUSD24h || 0;
     const devHolding = candidate.security.developerHoldingPct || 0;
     const velocity10s = momentum.buyTxCount10s;
+    const velocity30s = momentum.buyTxCount30s;
 
     // Hard Rules
     const marketCapPassed = mc > 4000;
     const liquidityPassed = liq > 4000;
     const volumePassed = vol > 5000;
     const developerPassed = devHolding < 5;
-    const buyVelocityPassed = velocity10s > 10;
+
+    // Beginning-Momentum Authorization Rule:
+    // Requires at least 1 recorded BUY in the monitoring window AND positive/increasing momentum signals.
+    const minBuyActivityPassed = velocity30s >= 1 || velocity10s >= 1;
+    const momentumIncreasingPassed =
+      momentum.earlyMomentumDetected ||
+      momentum.buyTxIncreasing ||
+      momentum.buyVelocityIncreasing ||
+      momentum.volumeIncreasing ||
+      momentum.priceMovingPositively;
+
+    const buyVelocityPassed = minBuyActivityPassed && momentumIncreasingPassed;
 
     const criteriaPassed = marketCapPassed && liquidityPassed && volumePassed && developerPassed && buyVelocityPassed;
 
@@ -137,7 +164,10 @@ export class BuyAuthorizationService {
     if (!volumePassed) rejectReasons.push('VOLUME_TOO_LOW');
     if (!developerPassed) rejectReasons.push('DEVELOPER_HOLDING_TOO_HIGH');
     if (!buyVelocityPassed) rejectReasons.push('BUY_TX_10S_TOO_LOW');
-    if (!rugcheckPassed) rejectReasons.push('SECURITY_GATE_FAILED');
+    if (!rugcheckPassed) {
+      const details = securityRejectReasons.length > 0 ? `: ${securityRejectReasons.join(', ')}` : '';
+      rejectReasons.push(`SECURITY_GATE_FAILED${details}`);
+    }
     if (isAlreadyHeld) rejectReasons.push('TOKEN_ALREADY_HELD');
 
     const execution: ExecutionResult = {

@@ -35,6 +35,7 @@ import { aiLearningEngine } from './src/server/aiLearningEngine.js';
 import { TokenDiscoveryService } from './src/server/tokenDiscoveryService.js';
 import { TraderWalletRepository } from './src/server/traderWalletRepository.js';
 import { RealExecutionService } from './src/server/realExecutionService.js';
+import { SolanaTransactionQueue } from './src/server/transactionQueue.js';
 import { PipelineDiagnostics } from './src/types.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
@@ -77,6 +78,7 @@ async function getSanitizedState() {
 
   currentConnectionStatus.pipeline = pipeline;
   currentConnectionStatus.traderStatuses = traderStatuses;
+  currentConnectionStatus.queueMetrics = SolanaTransactionQueue.getInstance(db, () => solanaConnection).getMetrics();
 
   return {
     settings: sanitizedSettings,
@@ -530,8 +532,8 @@ async function setupLogsSubscription() {
             lastError: null
           });
 
-          // Process transaction in background
-          processDetectedTransaction(logs.signature, trader);
+          // Enqueue transaction signature into rate-limited, concurrency-controlled queue
+          SolanaTransactionQueue.getInstance(db, () => solanaConnection).enqueue(logs.signature, trader);
         },
         'confirmed'
       );

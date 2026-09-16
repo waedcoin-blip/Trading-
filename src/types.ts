@@ -283,6 +283,7 @@ export interface ConnectionStatus {
   jupiter: JupiterStatus;
   pipeline?: PipelineDiagnostics;
   traderStatuses?: Record<string, TraderMonitoringStatus>;
+  queueMetrics?: any;
 }
 
 export interface TradeAuditRecord {
