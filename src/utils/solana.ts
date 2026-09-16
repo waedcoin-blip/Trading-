@@ -72,6 +72,29 @@ export function isValidSolanaSignature(signature: string | null | undefined): bo
 }
 
 /**
+ * Known Solana Base / Quote / Staking Assets exclusion list.
+ * Prevents treating standard collateral or stablecoins as speculative token trade candidates.
+ */
+export const BASE_ASSETS = new Set([
+  '11111111111111111111111111111111',
+  'So11111111111111111111111111111111111111112', // WSOL
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  // mSOL
+  'bSo13r4TkiE4KumLrvPMrM55zvZ6TkE3Vy6V8fAC23z',  // bSOL
+  'Jitosol111111111111111111111111111111111111', // JitoSOL
+  '7dHbWXmci3dT8UFYWYZweBLXgyu7Y3iL6trKn1Y7ARj'  // stSOL
+]);
+
+/**
+ * Checks if a given mint address is a base/stable asset that should be excluded from copy trading.
+ */
+export function isBaseAsset(mint: string | null | undefined): boolean {
+  if (!mint || typeof mint !== 'string') return true;
+  return BASE_ASSETS.has(mint.trim());
+}
+
+/**
  * Formats a token quantity cleanly with thousand-separators (commas)
  * and appropriate decimal precision without floating point anomalies or scientific notation.
  */

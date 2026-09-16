@@ -163,7 +163,7 @@ export class BuyAuthorizationService {
     if (!liquidityPassed) rejectReasons.push('LIQUIDITY_TOO_LOW');
     if (!volumePassed) rejectReasons.push('VOLUME_TOO_LOW');
     if (!developerPassed) rejectReasons.push('DEVELOPER_HOLDING_TOO_HIGH');
-    if (!buyVelocityPassed) rejectReasons.push('BUY_TX_10S_TOO_LOW');
+    if (!buyVelocityPassed) rejectReasons.push('BEGINNING_MOMENTUM_NOT_MET');
     if (!rugcheckPassed) {
       const details = securityRejectReasons.length > 0 ? `: ${securityRejectReasons.join(', ')}` : '';
       rejectReasons.push(`SECURITY_GATE_FAILED${details}`);

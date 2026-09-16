@@ -3,6 +3,7 @@ import bs58 from 'bs58';
 import { Database } from '../db';
 import { jupiterService } from './jupiterService';
 import { isValidSolanaMint, formatTokenQuantity } from '../utils/solana';
+import { SolanaRpcQueue } from './rpcQueue';
 
 export interface RealExecutionResult {
   success: boolean;
@@ -138,10 +139,11 @@ export class RealExecutionService {
       transaction.sign([keypair]);
 
       const rawTx = transaction.serialize();
-      txSignature = await connection.sendRawTransaction(rawTx, {
+      const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
+      txSignature = await rpcQueue.sendRawTransaction(rawTx, {
         skipPreflight: false,
         maxRetries: 3
-      });
+      }, 'HIGH');
 
       console.log(`[RealExecution] Transaction submitted to Solana RPC. Signature: ${txSignature}`);
     } catch (err: any) {
@@ -154,7 +156,8 @@ export class RealExecutionService {
 
     // 5. Confirm Transaction
     try {
-      const confirmation = await connection.confirmTransaction(txSignature, 'confirmed');
+      const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
+      const confirmation = await rpcQueue.confirmTransaction(txSignature, 'confirmed', 'HIGH');
       if (confirmation.value.err) {
         return {
           success: false,

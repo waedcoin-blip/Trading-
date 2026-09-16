@@ -1,7 +1,7 @@
 import { Connection, ParsedTransactionWithMeta, PublicKey } from '@solana/web3.js';
 import { TraderWallet, TradeCandidate } from '../types';
 import { Database } from '../db';
-import { isValidSolanaMint, isValidSolanaSignature } from '../utils/solana';
+import { isValidSolanaMint, isValidSolanaSignature, isBaseAsset } from '../utils/solana';
 import { TraderWalletRepository } from './traderWalletRepository';
 import { MomentumService } from './momentumService';
 import { BuyAuthorizationService } from './buyAuthorization';
@@ -10,6 +10,7 @@ import { scoreToken } from './ai';
 import { PaperExecutionService } from './paperExecutionService';
 import { RealExecutionService } from './realExecutionService';
 import { jupiterService } from './jupiterService';
+import { SolanaRpcQueue } from './rpcQueue';
 
 export type SignatureLifecycleStatus =
   | 'QUEUED'
@@ -208,46 +209,28 @@ export class SolanaTransactionQueue {
    * Core worker execution: fetches transaction with backoff/retries on 429, classifies, and executes copy trading if BUY.
    */
   private async processQueueItem(item: QueueItem): Promise<void> {
-    const conn = this.connectionSupplier();
-    if (!conn) {
-      console.warn(`[TX_RPC] No active Solana connection available for signature ${item.signature}. Re-queueing.`);
-      item.nextAttemptAt = Date.now() + 2000;
-      this.queuedItems.set(item.signature, item);
-      this.processingSignatures.delete(item.signature);
-      return;
-    }
-
     const fetchStart = Date.now();
 
     try {
-      // Fetch parsed transaction metadata from Solana RPC
-      let tx: ParsedTransactionWithMeta | null = null;
-
-      try {
-        tx = await conn.getParsedTransaction(item.signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed'
-        });
-      } catch (ver0Err: any) {
-        // Fallback retry with maxSupportedTransactionVersion = 1 if required
-        tx = await conn.getParsedTransaction(item.signature, {
-          maxSupportedTransactionVersion: 1,
-          commitment: 'confirmed'
-        });
-      }
+      // Route transaction lookup through central SolanaRpcQueue with fair wallet scheduling
+      const rpcQueue = SolanaRpcQueue.getInstance(this.connectionSupplier);
+      const tx = await rpcQueue.getParsedTransaction(
+        item.signature,
+        { maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+        'HIGH',
+        item.trader.wallet_address,
+        item.trader.name
+      );
 
       const latencyMs = Date.now() - fetchStart;
       this.latencies.push(latencyMs);
       if (this.latencies.length > 50) this.latencies.shift();
 
-      // Reset consecutive 429 count on success
       this.consecutive429Count = 0;
-
-      console.log(`[TX_RPC] signature=${item.signature} status=FETCHED latencyMs=${latencyMs}`);
       this.signatureStatuses.set(item.signature, 'FETCHED');
 
       if (!tx) {
-        console.log(`[Monitor] NON_BUY_TRANSACTION signature=${item.signature} reason=NULL_TRANSACTION trader=${item.trader.name}`);
+        console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${item.signature} reason=NULL_TRANSACTION trader=${item.trader.name}`);
         this.completeItem(item.signature, 'NON_BUY_TRANSACTION');
         return;
       }
@@ -266,18 +249,15 @@ export class SolanaTransactionQueue {
         item.retries++;
         this.totalRetries++;
 
-        // Trip circuit breaker if consecutive 429s exceed threshold
         if (this.consecutive429Count >= 5) {
           this.circuitBreakerUntil = Date.now() + 5000;
           console.warn(`[TX_RPC] Circuit breaker tripped for 5000ms due to repeated 429 responses.`);
         }
 
         if (item.retries <= this.maxRetries) {
-          // Exponential backoff with random jitter (500ms * 2^retries + jitter)
           const baseDelay = 500 * Math.pow(2, item.retries);
           const jitter = Math.floor(Math.random() * 300);
-          
-          // Check Retry-After header if available
+
           let retryAfterMs = 0;
           if (err?.headers && typeof err.headers.get === 'function') {
             const headerVal = err.headers.get('retry-after');
@@ -341,11 +321,11 @@ export class SolanaTransactionQueue {
     signature: string
   ): Promise<void> {
     if (!tx || !tx.meta) {
-      console.log(`[Monitor] NON_BUY_TRANSACTION signature=${signature} reason=MISSING_METADATA trader=${trader.name}`);
+      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=MISSING_METADATA trader=${trader.name}`);
       return;
     }
 
-    // Require successful transaction
+    // Explicitly handle failed on-chain transactions without treating them as token discovery errors
     if (tx.meta.err !== null) {
       console.log(`[Monitor] ONCHAIN_TX_SKIPPED signature=${signature} reason=ONCHAIN_ERR trader=${trader.name}`);
       return;
@@ -355,7 +335,7 @@ export class SolanaTransactionQueue {
     const traderIndex = accountKeys.indexOf(trader.wallet_address);
 
     if (traderIndex === -1) {
-      console.log(`[Monitor] NON_BUY_TRANSACTION signature=${signature} reason=TRADER_NOT_IN_ACCOUNTS trader=${trader.name}`);
+      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=TRADER_NOT_IN_ACCOUNTS trader=${trader.name}`);
       return;
     }
 
@@ -372,7 +352,7 @@ export class SolanaTransactionQueue {
     for (const post of postTokenBalances) {
       if (post.owner === trader.wallet_address) {
         const candidateMint = post.mint;
-        if (candidateMint !== WSOL_MINT && isValidSolanaMint(candidateMint)) {
+        if (isValidSolanaMint(candidateMint) && !isBaseAsset(candidateMint)) {
           const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
           const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
           const postAmount = Number(post.uiTokenAmount.amount);
@@ -387,10 +367,10 @@ export class SolanaTransactionQueue {
       }
     }
 
-    // Strict validation: If no non-WSOL token acquired, classify correctly (SELL, TRANSFER, SWAP_OTHER)
-    if (!targetMint || !isValidSolanaMint(targetMint)) {
+    // Strict validation: If no non-base SPL token acquired, classify accurately (SELL, TRANSFER, BASE_ASSET)
+    if (!targetMint || !isValidSolanaMint(targetMint) || isBaseAsset(targetMint)) {
       const isSell = postTokenBalances.some(post => {
-        if (post.owner === trader.wallet_address && post.mint !== WSOL_MINT) {
+        if (post.owner === trader.wallet_address && !isBaseAsset(post.mint)) {
           const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
           const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
           const postAmount = Number(post.uiTokenAmount.amount);
@@ -399,8 +379,10 @@ export class SolanaTransactionQueue {
         return false;
       });
 
-      const classification = isSell ? 'SELL' : 'NON_BUY_TRANSACTION';
-      console.log(`[Monitor] ${classification} signature=${signature} trader=${trader.name}`);
+      const isBaseTrade = postTokenBalances.some(post => post.owner === trader.wallet_address && isBaseAsset(post.mint));
+      const reason = isSell ? 'SELL_TRANSACTION' : (isBaseTrade ? 'BASE_ASSET_TRANSACTION' : 'TRANSFER_OR_OTHER');
+
+      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=${reason} trader=${trader.name}`);
       return;
     }
 
@@ -463,7 +445,7 @@ export class SolanaTransactionQueue {
     buyDetails: { signature: string; solSpent: number; tokenAcquiredAmount: number }
   ): Promise<void> {
     if (!isValidSolanaMint(mint)) {
-      console.warn(`[BUY_REJECTED] mint=${mint} reasons=INVALID_MINT`);
+      console.log(`[BUY_REJECTED] mint=${mint} reasons=INVALID_MINT`);
       return;
     }
 
@@ -507,7 +489,7 @@ export class SolanaTransactionQueue {
       volume24h === 'UNKNOWN' ||
       price === 'UNKNOWN'
     ) {
-      console.warn(`[BUY_REJECTED] mint=${mint} reasons=REQUIRED_MARKET_METRICS_UNAVAILABLE`);
+      console.log(`[BUY_REJECTED] mint=${mint} reasons=REQUIRED_MARKET_METRICS_UNAVAILABLE`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName || 'MARKET DATA PENDING',
@@ -597,7 +579,7 @@ export class SolanaTransactionQueue {
     const isAuthorized = decision.decision === 'AUTHORIZED';
 
     if (!isAuthorized) {
-      console.warn(`[BUY_REJECTED] mint=${mint} reasons=${decision.rejectReasons.join(', ')}`);
+      console.log(`[BUY_REJECTED] mint=${mint} reasons=${decision.rejectReasons.join(', ')}`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName,
@@ -705,5 +687,16 @@ export class SolanaTransactionQueue {
 
   public getSignatureStatus(signature: string): SignatureLifecycleStatus | undefined {
     return this.signatureStatuses.get(signature);
+  }
+
+  public getSignatureStatusesMap(): Record<string, { status: SignatureLifecycleStatus; trader?: string }> {
+    const result: Record<string, { status: SignatureLifecycleStatus; trader?: string }> = {};
+    for (const [sig, status] of this.signatureStatuses.entries()) {
+      result[sig] = {
+        status,
+        trader: this.signatureTraders.get(sig)
+      };
+    }
+    return result;
   }
 }

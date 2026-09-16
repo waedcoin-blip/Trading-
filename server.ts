@@ -36,6 +36,7 @@ import { TokenDiscoveryService } from './src/server/tokenDiscoveryService.js';
 import { TraderWalletRepository } from './src/server/traderWalletRepository.js';
 import { RealExecutionService } from './src/server/realExecutionService.js';
 import { SolanaTransactionQueue } from './src/server/transactionQueue.js';
+import { SolanaRpcQueue } from './src/server/rpcQueue.js';
 import { PipelineDiagnostics } from './src/types.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
@@ -147,6 +148,84 @@ app.get('/api/jupiter/health', async (req, res) => {
       endpointVersion: 'V3'
     });
   }
+});
+
+// --- API: Production Diagnostic Endpoints ---
+
+// 1. RPC Health & Central Queue Diagnostic Endpoint
+app.get('/api/diagnostics/rpc', (req, res) => {
+  const rpcMetrics = SolanaRpcQueue.getInstance(() => solanaConnection).getMetrics();
+  const queueMetrics = SolanaTransactionQueue.getInstance(db, () => solanaConnection).getMetrics();
+  const repo = TraderWalletRepository.getInstance(db);
+
+  res.json({
+    connected: currentConnectionStatus.rpc === 'CONNECTED',
+    endpoint: repo.getSanitizedRpcEndpoint(),
+    queueDepth: rpcMetrics.queuedCount,
+    activeRequests: rpcMetrics.activeWorkers,
+    requestsLastSecond: rpcMetrics.requestsLastSecond,
+    rateLimit429LastMinute: rpcMetrics.rateLimit429Count,
+    retrying: rpcMetrics.retriesCount,
+    completedLastMinute: rpcMetrics.completedLastMinute,
+    failedLastMinute: rpcMetrics.failedLastMinute,
+    oldestQueuedMs: rpcMetrics.oldestQueuedAgeMs,
+    circuitBreakerActive: rpcMetrics.circuitBreakerActive,
+    transactionQueueDepth: queueMetrics.queuedCount,
+    avgFetchLatencyMs: rpcMetrics.avgFetchLatencyMs
+  });
+});
+
+// 2. Trader Wallet Monitoring Diagnostic Endpoint
+app.get('/api/diagnostics/traders', async (req, res) => {
+  const repo = TraderWalletRepository.getInstance(db);
+  const wallets = await repo.getTraderWallets();
+  const statuses = repo.getMonitoringStatuses();
+  const monitoredTxs = db.getMonitoredTransactions();
+
+  const tradersDiagnostics = wallets.map(w => {
+    const status = (statuses[w.id] || {}) as any;
+    const traderTxs = monitoredTxs.filter(t => t.trader_wallet_id === w.id);
+    const buyCount = traderTxs.filter(t => t.transaction_type === 'BUY').length;
+    const sellCount = traderTxs.filter(t => t.transaction_type === 'SELL').length;
+
+    return {
+      id: w.id,
+      name: w.name,
+      wallet_address: w.wallet_address,
+      enabled: w.enabled,
+      subscriptionStatus: status.subscriptionStatus || 'IDLE',
+      lastDetectedSignature: status.lastDetectedSignature || null,
+      lastProcessedTimestamp: status.lastProcessedTimestamp || null,
+      totalDetectedEvents: traderTxs.length,
+      buyEventsCount: buyCount,
+      sellEventsCount: sellCount,
+      lastError: status.lastError || null
+    };
+  });
+
+  res.json({
+    totalMonitoredTraders: wallets.length,
+    activeMonitoredTraders: wallets.filter(w => w.enabled).length,
+    postgresActive: repo.isPostgresActive(),
+    traders: tradersDiagnostics
+  });
+});
+
+// 3. Copy-Trade Audits & Decision Trace Endpoint
+app.get(['/api/diagnostics/copy-trade', '/api/diagnostics/audits'], (req, res) => {
+  const audits = db.getBuyAuthorizationAudits();
+  res.json({
+    totalAudits: audits.length,
+    audits
+  });
+});
+
+// 4. Transaction Lifecycle Traces Map Endpoint
+app.get('/api/diagnostics/traces', (req, res) => {
+  const queue = SolanaTransactionQueue.getInstance(db, () => solanaConnection);
+  res.json({
+    signatures: queue.getSignatureStatusesMap()
+  });
 });
 
 // API: Get current state
@@ -562,124 +641,7 @@ async function setupLogsSubscription() {
 
 // Real Transaction Parsing & Token Discovery
 async function processDetectedTransaction(signature: string, trader: TraderWallet) {
-  if (processedSignatures.has(signature)) return;
-  processedSignatures.add(signature);
-
-  console.log(`[Monitor] Processing transaction ${signature} for trader ${trader.name}`);
-
-  try {
-    if (!solanaConnection) {
-      console.warn('[Monitor] No active Solana RPC connection available.');
-      return;
-    }
-
-    // Retrieve full parsed transaction from blockchain (supports both Version 0 and Version 1 transactions)
-    let tx = null;
-    try {
-      tx = await solanaConnection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed'
-      });
-    } catch (verErr: any) {
-      try {
-        tx = await solanaConnection.getParsedTransaction(signature, {
-          maxSupportedTransactionVersion: 1,
-          commitment: 'confirmed'
-        });
-      } catch (retryErr: any) {
-        console.warn(`[Monitor] Could not parse transaction ${signature}: ${retryErr?.message || retryErr}`);
-        return;
-      }
-    }
-
-    if (!tx || !tx.meta) {
-      console.warn(`[Monitor] Could not fetch parsed transaction metadata for signature: ${signature}`);
-      return;
-    }
-
-    const slot = tx.slot || 0;
-    const blockTime = tx.blockTime || Math.floor(Date.now() / 1000);
-
-    // Locate the monitored trader's account index
-    const accountKeys = tx.transaction.message.accountKeys.map(a => a.pubkey.toString());
-    const traderIndex = accountKeys.indexOf(trader.wallet_address);
-
-    if (traderIndex === -1) {
-      console.warn(`[Monitor] Monitored trader ${trader.wallet_address} not found in transaction accounts.`);
-      return;
-    }
-
-    // SOL Balance Change Analysis
-    const preSol = tx.meta.preBalances[traderIndex];
-    const postSol = tx.meta.postBalances[traderIndex];
-    const solSpentLamports = preSol - postSol; // If positive, trader spent SOL
-
-    if (solSpentLamports <= 0) {
-      console.log(`[Monitor] Transaction ${signature} is not a SOL-spending BUY. Ignoring.`);
-      return;
-    }
-
-    // SPL Token Balance Change Analysis
-    const preTokenBalances = tx.meta.preTokenBalances || [];
-    const postTokenBalances = tx.meta.postTokenBalances || [];
-
-    let targetMint = '';
-    let targetDecimals = 0;
-    let tokenAcquiredAmount = 0;
-
-    for (const post of postTokenBalances) {
-      if (post.owner === trader.wallet_address) {
-        const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
-        const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
-        const postAmount = Number(post.uiTokenAmount.amount);
-
-        if (postAmount > preAmount) {
-          const candidateMint = post.mint;
-          if (isValidSolanaMint(candidateMint)) {
-            targetMint = candidateMint;
-            targetDecimals = post.uiTokenAmount.decimals;
-            tokenAcquiredAmount = (postAmount - preAmount) / Math.pow(10, targetDecimals);
-            break;
-          }
-        }
-      }
-    }
-
-    // Strict validation: Reject if no valid Solana mint detected
-    if (!targetMint || !isValidSolanaMint(targetMint)) {
-      console.warn(`[TokenDiscovery] REJECTED: No valid Solana mint identified in transaction ${signature}`);
-      return;
-    }
-
-    const solSpent = solSpentLamports / 1e9;
-
-    // Diagnostic logging as required by production specifications
-    console.log(`[TokenDiscovery] Real Solana token detected\nMint: ${targetMint}\nTrader: ${trader.name} (${trader.wallet_address})\nSignature: ${signature}\nSlot: ${slot}`);
-
-    // Log genuine monitored transaction into database
-    db.addMonitoredTransaction({
-      signature,
-      trader_wallet_id: trader.id,
-      token_mint: targetMint,
-      transaction_type: 'BUY',
-      sol_amount: solSpent,
-      token_amount: tokenAcquiredAmount,
-      timestamp: new Date(blockTime * 1000).toISOString()
-    });
-
-    // Record in rolling MomentumService for unique buyers/10s calculations
-    MomentumService.getInstance().recordTransaction(targetMint, 'BUY', signature, solSpent);
-
-    // Run DexScreener metrics gate, filters, AI scoring, and copy-trading execution
-    await evaluateAndCopyToken(targetMint, targetDecimals, trader, {
-      signature,
-      solSpent,
-      tokenAcquiredAmount
-    });
-
-  } catch (err) {
-    console.error(`[Monitor] Error parsing transaction ${signature}:`, err);
-  }
+  SolanaTransactionQueue.getInstance(db, () => solanaConnection).enqueue(signature, trader);
 }
 
 // Fetch on-chain developer holding or authority status
@@ -687,7 +649,7 @@ async function getOnChainDevHolding(mintStr: string): Promise<number | 'UNKNOWN'
   try {
     if (!solanaConnection) return 'UNKNOWN';
     const mintPk = new PublicKey(mintStr);
-    const accInfo = await solanaConnection.getParsedAccountInfo(mintPk);
+    const accInfo = await SolanaRpcQueue.getInstance(() => solanaConnection).getParsedAccountInfo(mintPk, 'LOW');
     const parsed = (accInfo.value?.data as any)?.parsed?.info;
     if (parsed) {
       const mintAuthority = parsed.mintAuthority;
@@ -710,7 +672,7 @@ async function evaluateAndCopyToken(
   buyDetails: { signature: string; solSpent: number; tokenAcquiredAmount: number }
 ) {
   if (!isValidSolanaMint(mint)) {
-    console.warn(`[Filters] REJECTED invalid mint passed to evaluation: "${mint}"`);
+    console.log(`[Filters] REJECTED invalid mint passed to evaluation: "${mint}"`);
     return;
   }
 
@@ -758,7 +720,7 @@ async function evaluateAndCopyToken(
     volume24h === 'UNKNOWN' || 
     price === 'UNKNOWN'
   ) {
-    console.warn(`[TokenMetrics] REJECTED\nMint: ${mint}\nReason: Required market metrics unavailable`);
+    console.log(`[TokenMetrics] REJECTED\nMint: ${mint}\nReason: Required market metrics unavailable`);
     db.addTokenObservation({
       token_mint: mint,
       token_name: tokenName || 'WAITING FOR MARKET DATA',
@@ -950,7 +912,7 @@ async function getMintDecimals(mintStr: string): Promise<number> {
   try {
     if (solanaConnection && isValidSolanaMint(mintStr)) {
       const mintPk = new PublicKey(mintStr);
-      const accInfo = await solanaConnection.getParsedAccountInfo(mintPk);
+      const accInfo = await SolanaRpcQueue.getInstance(() => solanaConnection).getParsedAccountInfo(mintPk, 'LOW');
       const parsed = (accInfo.value?.data as any)?.parsed?.info;
       if (parsed && typeof parsed.decimals === 'number') {
         return parsed.decimals;
@@ -1297,9 +1259,10 @@ async function reconcilePositionWithOnChainBalance(pos: Position): Promise<{ mat
     const ownerPubkey = new PublicKey(targetWalletStr);
     const mintPubkey = new PublicKey(pos.token_mint);
 
-    const accounts = await solanaConnection.getParsedTokenAccountsByOwner(
+    const accounts = await SolanaRpcQueue.getInstance(() => solanaConnection).getParsedTokenAccountsByOwner(
       ownerPubkey, 
-      { mint: mintPubkey }
+      { mint: mintPubkey },
+      'LOW'
     );
 
     if (accounts.value && accounts.value.length > 0) {
