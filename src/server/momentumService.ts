@@ -82,6 +82,18 @@ export class MomentumService {
     const totalCount10s = buyCount10s + sellCount10s;
     const buyAcceleration = buyCount5s / (buyCount10s || 1); // Buys in 5s relative to 10s
 
+    const priceChange10s = totalCount10s > 0 ? (buyCount10s - sellCount10s) / totalCount10s : 0;
+    const priceChange30s = (buyCount30s - sellCount30s) / ((buyCount30s + sellCount30s) || 1);
+
+    // Beginning-momentum window indicators
+    const buyTxIncreasing = buyCount5s > 0 || buyCount10s > 0;
+    const buyVelocityIncreasing = buyAcceleration >= 0.5 || buyCount10s >= 1;
+    const volumeIncreasing = buyVolume10s >= sellVolume10s;
+    const priceMovingPositively = priceChange10s >= 0;
+
+    // Early momentum flag
+    const earlyMomentumDetected = buyTxIncreasing && buyVelocityIncreasing && volumeIncreasing && priceMovingPositively;
+
     return {
       buyTxCount5s: buyCount5s,
       buyTxCount10s: buyCount10s,
@@ -91,10 +103,15 @@ export class MomentumService {
       sellTxCount30s: sellCount30s,
       buyVolume10s,
       sellVolume10s,
-      priceChange10s: totalCount10s > 0 ? (buyCount10s - sellCount10s) / totalCount10s : 0,
-      priceChange30s: (buyCount30s - sellCount30s) / ((buyCount30s + sellCount30s) || 1),
-      priceChange5m: 0, // Placeholder
-      buyAcceleration
+      priceChange10s,
+      priceChange30s,
+      priceChange5m: 0,
+      buyAcceleration,
+      buyTxIncreasing,
+      buyVelocityIncreasing,
+      volumeIncreasing,
+      priceMovingPositively,
+      earlyMomentumDetected
     };
   }
 

@@ -56,7 +56,12 @@ export class BuyAuthorizationService {
       priceChange10s: momentumMetrics.priceChange10s,
       priceChange30s: momentumMetrics.priceChange30s,
       priceChange5m: momentumMetrics.priceChange5m,
-      buyAcceleration: momentumMetrics.buyAcceleration
+      buyAcceleration: momentumMetrics.buyAcceleration,
+      buyTxIncreasing: momentumMetrics.buyTxIncreasing,
+      buyVelocityIncreasing: momentumMetrics.buyVelocityIncreasing,
+      volumeIncreasing: momentumMetrics.volumeIncreasing,
+      priceMovingPositively: momentumMetrics.priceMovingPositively,
+      earlyMomentumDetected: momentumMetrics.earlyMomentumDetected
     };
 
     // 2. Fetch Security Details via RugCheck

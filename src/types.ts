@@ -503,6 +503,11 @@ export interface MomentumResult {
   priceChange30s: number;
   priceChange5m: number;
   buyAcceleration: number;
+  buyTxIncreasing?: boolean;
+  buyVelocityIncreasing?: boolean;
+  volumeIncreasing?: boolean;
+  priceMovingPositively?: boolean;
+  earlyMomentumDetected?: boolean;
 }
 
 export interface ExecutionResult {
