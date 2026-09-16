@@ -445,7 +445,7 @@ export class SolanaTransactionQueue {
     buyDetails: { signature: string; solSpent: number; tokenAcquiredAmount: number }
   ): Promise<void> {
     if (!isValidSolanaMint(mint)) {
-      console.log(`[BUY_REJECTED] mint=${mint} reasons=INVALID_MINT`);
+      console.log(`[EVALUATION] FILTERED mint=${mint} reason=INVALID_MINT`);
       return;
     }
 
@@ -489,7 +489,7 @@ export class SolanaTransactionQueue {
       volume24h === 'UNKNOWN' ||
       price === 'UNKNOWN'
     ) {
-      console.log(`[BUY_REJECTED] mint=${mint} reasons=REQUIRED_MARKET_METRICS_UNAVAILABLE`);
+      console.log(`[EVALUATION] FILTERED mint=${mint} reason=REQUIRED_MARKET_METRICS_UNAVAILABLE`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName || 'MARKET DATA PENDING',
@@ -579,7 +579,7 @@ export class SolanaTransactionQueue {
     const isAuthorized = decision.decision === 'AUTHORIZED';
 
     if (!isAuthorized) {
-      console.log(`[BUY_REJECTED] mint=${mint} reasons=${decision.rejectReasons.join(', ')}`);
+      console.log(`[EVALUATION] FILTERED mint=${mint} reason=${decision.rejectReasons.join(', ')}`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName,
