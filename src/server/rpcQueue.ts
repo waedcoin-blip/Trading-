@@ -59,6 +59,7 @@ export class SolanaRpcQueue {
   private requestTimestamps: number[] = [];
   private consecutive429Count = 0;
   private circuitBreakerUntil = 0;
+  private circuitBreakerTimer: NodeJS.Timeout | null = null;
 
   // Rolling metrics counters
   private totalCompleted = 0;
@@ -224,12 +225,22 @@ export class SolanaRpcQueue {
   private triggerWorkerPool(): void {
     const now = Date.now();
 
-    // Respect circuit breaker
+    // Respect circuit breaker with automatic scheduled wakeup
     if (now < this.circuitBreakerUntil) {
+      const waitMs = this.circuitBreakerUntil - now;
+      if (!this.circuitBreakerTimer) {
+        this.circuitBreakerTimer = setTimeout(() => {
+          this.circuitBreakerTimer = null;
+          this.triggerWorkerPool();
+        }, waitMs + 25);
+      }
       return;
     }
 
-    while (this.activeWorkers < this.concurrency && this.queuedTasks.length > 0) {
+    // Half-open probe state: If recovering from 429s, allow only 1 concurrent probe request
+    const effectiveConcurrency = this.consecutive429Count > 0 ? 1 : this.concurrency;
+
+    while (this.activeWorkers < effectiveConcurrency && this.queuedTasks.length > 0) {
       if (!this.canMakeRpcRequest()) {
         break;
       }
@@ -294,6 +305,14 @@ export class SolanaRpcQueue {
     }
   }
 
+  public isCircuitBreakerActive(): boolean {
+    return Date.now() < this.circuitBreakerUntil;
+  }
+
+  public getCircuitBreakerRemainingMs(): number {
+    return Math.max(0, this.circuitBreakerUntil - Date.now());
+  }
+
   private canMakeRpcRequest(): boolean {
     const now = Date.now();
     this.requestTimestamps = this.requestTimestamps.filter(t => now - t < 1000);
@@ -341,30 +360,39 @@ export class SolanaRpcQueue {
         task.retries++;
         this.totalRetries++;
 
-        if (this.consecutive429Count >= 5) {
-          this.circuitBreakerUntil = Date.now() + 5000;
-          console.warn(`[RPC_QUEUE] Circuit breaker tripped for 5000ms due to 5 consecutive 429 rate limit responses.`);
+        // Global backpressure circuit breaker: engage immediately from the very first 429
+        const baseCircuitMs = 2500;
+        const exponentialFactor = Math.min(15000, baseCircuitMs * Math.pow(1.5, Math.min(this.consecutive429Count - 1, 4)));
+        const jitter = Math.floor(Math.random() * 400);
+
+        let retryAfterMs = 0;
+        if (err?.headers && typeof err.headers.get === 'function') {
+          const headerVal = err.headers.get('retry-after');
+          if (headerVal) {
+            const seconds = parseInt(headerVal, 10);
+            if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
+          }
         }
 
+        const circuitDuration = Math.max(exponentialFactor + jitter, retryAfterMs);
+        this.circuitBreakerUntil = Math.max(this.circuitBreakerUntil, Date.now() + circuitDuration);
+
+        console.warn(`[RPC_QUEUE] Global 429 backpressure active for ${Math.round(circuitDuration)}ms (consecutive=${this.consecutive429Count})`);
+
+        if (this.circuitBreakerTimer) {
+          clearTimeout(this.circuitBreakerTimer);
+        }
+        this.circuitBreakerTimer = setTimeout(() => {
+          this.circuitBreakerTimer = null;
+          this.triggerWorkerPool();
+        }, circuitDuration + 25);
+
         if (task.retries <= this.maxRetries) {
-          const baseDelay = 500 * Math.pow(2, task.retries);
-          const jitter = Math.floor(Math.random() * 300);
-
-          let retryAfterMs = 0;
-          if (err?.headers && typeof err.headers.get === 'function') {
-            const headerVal = err.headers.get('retry-after');
-            if (headerVal) {
-              const seconds = parseInt(headerVal, 10);
-              if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
-            }
-          }
-
-          const delayMs = Math.min(20000, Math.max(baseDelay + jitter, retryAfterMs));
-          task.nextAttemptAt = Date.now() + delayMs;
+          task.nextAttemptAt = this.circuitBreakerUntil + Math.floor(Math.random() * 500);
           task.lastError = errMsg;
 
           this.queuedTasks.push(task);
-          console.warn(`[RPC_QUEUE] signature=${task.signature || 'N/A'} action=${task.actionName} attempt=${task.retries}/${this.maxRetries} status=429_RETRY_WAIT retryInMs=${Math.round(delayMs)}`);
+          console.warn(`[RPC_QUEUE] signature=${task.signature || 'N/A'} action=${task.actionName} attempt=${task.retries}/${this.maxRetries} status=429_RETRY_WAIT retryInMs=${Math.round(task.nextAttemptAt - Date.now())}`);
           return;
         } else {
           console.error(`[RPC_QUEUE] signature=${task.signature || 'N/A'} action=${task.actionName} FAILED_PERMANENTLY after ${task.retries} retries due to 429 rate limit.`);

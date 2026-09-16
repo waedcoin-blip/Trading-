@@ -470,8 +470,19 @@ let currentConnectionStatus: ConnectionStatus = {
   jupiter: 'NOT_CONFIGURED'
 };
 
-// Map of processed transaction signatures to avoid duplicate copy trading (Idempotency)
+// Bounded set of processed transaction signatures to avoid duplicate copy trading (Idempotency)
+const MAX_PROCESSED_SIGNATURES = 50000;
 const processedSignatures = new Set<string>();
+
+function markSignatureSeen(sig: string): boolean {
+  if (processedSignatures.has(sig)) return false;
+  if (processedSignatures.size >= MAX_PROCESSED_SIGNATURES) {
+    const oldest = processedSignatures.values().next().value;
+    if (oldest) processedSignatures.delete(oldest);
+  }
+  processedSignatures.add(sig);
+  return true;
+}
 
 // Solana Connection instances
 let solanaConnection: Connection | null = null;
@@ -601,7 +612,7 @@ async function setupLogsSubscription() {
       const subId = solanaConnection.onLogs(
         pubkey,
         async (logs) => {
-          if (!logs.signature || processedSignatures.has(logs.signature)) return;
+          if (!logs.signature || !markSignatureSeen(logs.signature)) return;
           console.log(`[Solana] Real on-chain log event detected on wallet ${trader.name} (${trader.wallet_address}). Signature: ${logs.signature}`);
           
           repo.updateTraderMonitoringStatus(trader.id, {
@@ -672,7 +683,7 @@ async function evaluateAndCopyToken(
   buyDetails: { signature: string; solSpent: number; tokenAcquiredAmount: number }
 ) {
   if (!isValidSolanaMint(mint)) {
-    console.log(`[Filters] REJECTED invalid mint passed to evaluation: "${mint}"`);
+    console.log(`[Filters] Skipped invalid mint passed to evaluation: "${mint}"`);
     return;
   }
 
@@ -711,7 +722,7 @@ async function evaluateAndCopyToken(
     console.error('[Filters] Failed to retrieve token metrics from DexScreener:', err);
   }
 
-  // Strict Data Completeness Gate: If crucial metrics are missing, reject immediately. Do NOT fabricate data.
+  // Data Completeness Gate: If crucial metrics are missing, defer evaluation rather than rejecting.
   if (
     !tokenName ||
     !tokenSymbol ||
@@ -720,7 +731,7 @@ async function evaluateAndCopyToken(
     volume24h === 'UNKNOWN' || 
     price === 'UNKNOWN'
   ) {
-    console.log(`[TokenMetrics] REJECTED\nMint: ${mint}\nReason: Required market metrics unavailable`);
+    console.log(`[TokenMetrics] Market data pending for mint: ${mint} (deferring evaluation)`);
     db.addTokenObservation({
       token_mint: mint,
       token_name: tokenName || 'WAITING FOR MARKET DATA',
@@ -731,8 +742,8 @@ async function evaluateAndCopyToken(
       developer_holding_percent: developerHoldingPercent,
       buyers_10s: 0,
       price: price,
-      status: 'REJECT',
-      rejection_reason: 'Required market metrics unavailable on DexScreener',
+      status: 'WAIT',
+      rejection_reason: 'Market metrics temporarily unavailable on DexScreener (pending DEX indexing)',
       source_trader_name: trader.name
     });
     broadcastState();

@@ -34,6 +34,7 @@ export interface QueueItem {
   enqueuedAt: number;
   status: SignatureLifecycleStatus;
   retries: number;
+  nullRetries?: number;
   nextAttemptAt: number;
   lastError?: string;
 }
@@ -73,6 +74,7 @@ export class SolanaTransactionQueue {
   private activeWorkers = 0;
   private consecutive429Count = 0;
   private circuitBreakerUntil = 0;
+  private circuitBreakerTimer: NodeJS.Timeout | null = null;
 
   // Diagnostic Metrics
   private totalCompleted = 0;
@@ -147,8 +149,22 @@ export class SolanaTransactionQueue {
   public triggerWorkerPool(): void {
     const now = Date.now();
 
-    // Check circuit breaker
-    if (now < this.circuitBreakerUntil) {
+    // Check both local and global RPC circuit breaker
+    const rpcQueue = SolanaRpcQueue.getInstance(this.connectionSupplier);
+    const rpcBreakerActive = rpcQueue.isCircuitBreakerActive();
+    const localBreakerActive = now < this.circuitBreakerUntil;
+
+    if (localBreakerActive || rpcBreakerActive) {
+      const waitMs = Math.max(
+        this.circuitBreakerUntil - now,
+        rpcQueue.getCircuitBreakerRemainingMs()
+      );
+      if (!this.circuitBreakerTimer && waitMs > 0) {
+        this.circuitBreakerTimer = setTimeout(() => {
+          this.circuitBreakerTimer = null;
+          this.triggerWorkerPool();
+        }, waitMs + 25);
+      }
       return;
     }
 
@@ -230,9 +246,22 @@ export class SolanaTransactionQueue {
       this.signatureStatuses.set(item.signature, 'FETCHED');
 
       if (!tx) {
-        console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${item.signature} reason=NULL_TRANSACTION trader=${item.trader.name}`);
-        this.completeItem(item.signature, 'NON_BUY_TRANSACTION');
-        return;
+        // Handle Solana RPC indexer lag: parsed transaction may take 300-1500ms to be indexed
+        item.nullRetries = (item.nullRetries || 0) + 1;
+        if (item.nullRetries <= 3) {
+          const delayMs = 750 * item.nullRetries;
+          item.status = 'RETRY_WAIT';
+          item.nextAttemptAt = Date.now() + delayMs;
+          this.signatureStatuses.set(item.signature, 'RETRY_WAIT');
+          this.queuedItems.set(item.signature, item);
+          this.processingSignatures.delete(item.signature);
+          console.log(`[TX_FETCHER] TRANSACTION_PENDING_INDEXING signature=${item.signature} attempt=${item.nullRetries}/3 retryInMs=${delayMs} trader=${item.trader.name}`);
+          return;
+        } else {
+          console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${item.signature} reason=INDEX_TIMEOUT_NULL trader=${item.trader.name}`);
+          this.completeItem(item.signature, 'NON_BUY_TRANSACTION');
+          return;
+        }
       }
 
       // Classify and process the transaction
@@ -249,25 +278,12 @@ export class SolanaTransactionQueue {
         item.retries++;
         this.totalRetries++;
 
-        if (this.consecutive429Count >= 5) {
-          this.circuitBreakerUntil = Date.now() + 5000;
-          console.warn(`[TX_RPC] Circuit breaker tripped for 5000ms due to repeated 429 responses.`);
-        }
+        const rpcQueue = SolanaRpcQueue.getInstance(this.connectionSupplier);
+        const backpressureWait = Math.max(3000, rpcQueue.getCircuitBreakerRemainingMs());
+        this.circuitBreakerUntil = Math.max(this.circuitBreakerUntil, Date.now() + backpressureWait);
 
         if (item.retries <= this.maxRetries) {
-          const baseDelay = 500 * Math.pow(2, item.retries);
-          const jitter = Math.floor(Math.random() * 300);
-
-          let retryAfterMs = 0;
-          if (err?.headers && typeof err.headers.get === 'function') {
-            const headerVal = err.headers.get('retry-after');
-            if (headerVal) {
-              const seconds = parseInt(headerVal, 10);
-              if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
-            }
-          }
-
-          const delayMs = Math.min(20000, Math.max(baseDelay + jitter, retryAfterMs));
+          const delayMs = backpressureWait + Math.floor(Math.random() * 400);
           item.status = 'RETRY_WAIT';
           item.nextAttemptAt = Date.now() + delayMs;
           item.lastError = errMsg;
@@ -276,7 +292,7 @@ export class SolanaTransactionQueue {
           this.queuedItems.set(item.signature, item);
           this.processingSignatures.delete(item.signature);
 
-          console.warn(`[TX_RPC] signature=${item.signature} attempt=${item.retries} status=429 retryMs=${Math.round(delayMs)}`);
+          console.warn(`[TX_RPC] signature=${item.signature} status=RPC_429_DEFERRED attempt=${item.retries}/${this.maxRetries} retryInMs=${delayMs}`);
           return;
         } else {
           console.error(`[TX_RPC] signature=${item.signature} FAILED_PERMANENTLY after ${item.retries} retries due to 429 rate limit.`);
@@ -445,7 +461,7 @@ export class SolanaTransactionQueue {
     buyDetails: { signature: string; solSpent: number; tokenAcquiredAmount: number }
   ): Promise<void> {
     if (!isValidSolanaMint(mint)) {
-      console.log(`[EVALUATION] FILTERED mint=${mint} reason=INVALID_MINT`);
+      console.log(`[TradeEngine] Skipped evaluation for ${mint}: invalid mint`);
       return;
     }
 
@@ -489,7 +505,7 @@ export class SolanaTransactionQueue {
       volume24h === 'UNKNOWN' ||
       price === 'UNKNOWN'
     ) {
-      console.log(`[EVALUATION] FILTERED mint=${mint} reason=REQUIRED_MARKET_METRICS_UNAVAILABLE`);
+      console.log(`[TradeEngine] Market metrics pending indexing for mint=${mint} (deferred)`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName || 'MARKET DATA PENDING',
@@ -500,8 +516,8 @@ export class SolanaTransactionQueue {
         developer_holding_percent: developerHoldingPercent,
         buyers_10s: 0,
         price: price,
-        status: 'REJECT',
-        rejection_reason: 'Required market metrics unavailable on DexScreener',
+        status: 'WAIT',
+        rejection_reason: 'Market metrics temporarily unavailable on DexScreener (pending DEX indexing)',
         source_trader_name: trader.name
       });
       return;
@@ -579,7 +595,7 @@ export class SolanaTransactionQueue {
     const isAuthorized = decision.decision === 'AUTHORIZED';
 
     if (!isAuthorized) {
-      console.log(`[EVALUATION] FILTERED mint=${mint} reason=${decision.rejectReasons.join(', ')}`);
+      console.log(`[TradeEngine] Evaluation complete for mint=${mint}: criteria not met`);
       this.db.addTokenObservation({
         token_mint: mint,
         token_name: tokenName,

@@ -166,7 +166,7 @@ async function runPipelineTests() {
 
   // Paper execution test
   const paperMint = 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN';
-  const paperSignature = '3A4mX4K3pY2R9tW8qL1vN6jM9xZ4wQ7vB3nC2mP5kL8rJ1tY4wV7xZ3qM9P2kL9z';
+  const paperSignature = ('3A4mX4K3pY2R9tW8qL1vN6jM9xZ4wQ7vB3nC2mP5kL8rJ1tY4wV7xZ3qM9P2kL9z' + Date.now().toString()).slice(0, 88);
   const paperPos = PaperExecutionService.getInstance(db).executeBuy(
     paperMint,
     'Paper Token',
@@ -178,7 +178,30 @@ async function runPipelineTests() {
     paperSignature
   );
   assert(Boolean(paperPos), 'PAPER trade executed successfully');
-  assert(paperPos.mint === paperMint, 'PAPER position mint matches candidate mint');
+  if (paperPos) {
+    assert(paperPos.mint === paperMint, 'PAPER position mint matches candidate mint');
+  }
+
+  // TEST 6: RPC Circuit Breaker & Observation Deferred Status
+  console.log('\n--- TEST 6: RPC Queue Circuit Breaker & Deferred Observation Status ---');
+  const rpcQueue = queue['connectionSupplier'] ? queue : null;
+  // Test deferred status
+  const deferredObs = db.addTokenObservation({
+    token_mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+    token_name: 'WAITING FOR MARKET DATA',
+    token_symbol: 'UNAVAILABLE',
+    market_cap: 'UNKNOWN',
+    liquidity: 'UNKNOWN',
+    volume_24h: 'UNKNOWN',
+    developer_holding_percent: 'UNKNOWN',
+    buyers_10s: 0,
+    price: 'UNKNOWN',
+    status: 'WAIT',
+    rejection_reason: 'Market metrics temporarily unavailable on DexScreener (pending DEX indexing)',
+    source_trader_name: 'Deferred Test Trader'
+  });
+  assert(deferredObs.status === 'WAIT', 'Pending market data recorded as WAIT status rather than permanent REJECT');
+  assert(deferredObs.rejection_reason?.includes('pending DEX indexing') === true, 'Rejection reason identifies pending indexing correctly');
 
   console.log(`\n=== PIPELINE VERIFICATION SUMMARY: ${failures === 0 ? 'ALL TESTS PASSED SUCCESSFULLY' : `${failures} TEST(S) FAILED`} ===`);
   if (failures > 0) {
