@@ -474,11 +474,24 @@ async function processDetectedTransaction(signature: string, trader: TraderWalle
       return;
     }
 
-    // Retrieve full parsed transaction from blockchain
-    const tx = await solanaConnection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed'
-    });
+    // Retrieve full parsed transaction from blockchain (supports both Version 0 and Version 1 transactions)
+    let tx = null;
+    try {
+      tx = await solanaConnection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed'
+      });
+    } catch (verErr: any) {
+      try {
+        tx = await solanaConnection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 1,
+          commitment: 'confirmed'
+        });
+      } catch (retryErr: any) {
+        console.warn(`[Monitor] Could not parse transaction ${signature}: ${retryErr?.message || retryErr}`);
+        return;
+      }
+    }
 
     if (!tx || !tx.meta) {
       console.warn(`[Monitor] Could not fetch parsed transaction metadata for signature: ${signature}`);
