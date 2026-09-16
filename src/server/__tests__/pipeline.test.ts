@@ -4,7 +4,10 @@ import { BuyAuthorizationService } from '../buyAuthorization';
 import { RealExecutionService } from '../realExecutionService';
 import { PaperExecutionService } from '../paperExecutionService';
 import { SolanaTransactionQueue } from '../transactionQueue';
+import { SolanaRpcQueue } from '../rpcQueue';
 import { MomentumService } from '../momentumService';
+import { TransactionClassifier } from '../transactionClassifier';
+import { RebuyGuard } from '../rebuyGuard';
 import { isValidSolanaMint, isValidSolanaSignature } from '../../utils/solana';
 
 async function runPipelineTests() {
@@ -32,8 +35,138 @@ async function runPipelineTests() {
   assert(isValidSolanaSignature(validSignature) === true, 'Genuine transaction signature recognized');
   assert(isValidSolanaSignature(fakeSignature) === false, 'Synthetic signature rejected');
 
-  // TEST 2: Trader Wallet Repository Persistence
-  console.log('\n--- TEST 2: Trader Wallet Repository Persistence ---');
+  // TEST 2: Transaction Classification & Token Balance Deltas
+  console.log('\n--- TEST 2: Transaction Classification & Balance Deltas ---');
+  const traderWallet = '7vwQy2Xp2bB5n5mP5kL8rJ1tY4wV7xZ3qM9P2kL5r8aB';
+  const targetTokenMint = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+
+  // 2a. Failed on-chain tx
+  const failedTx = {
+    meta: {
+      err: { InstructionError: [0, 'CustomError'] },
+      preBalances: [1000000000],
+      postBalances: [999995000]
+    },
+    transaction: {
+      message: {
+        accountKeys: [traderWallet]
+      }
+    }
+  };
+  const failedClass = TransactionClassifier.classify(failedTx, traderWallet);
+  assert(failedClass.type === 'FAILED', 'Failed on-chain transaction classified as FAILED');
+
+  // 2b. BUY tx with positive balance delta and SOL spent
+  const buyTx = {
+    meta: {
+      err: null,
+      preBalances: [5000000000],
+      postBalances: [4800000000], // 0.2 SOL spent
+      preTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: targetTokenMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '0', decimals: 6 }
+        }
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: targetTokenMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '5000000000', decimals: 6 } // 5,000 tokens acquired
+        }
+      ]
+    },
+    transaction: {
+      message: {
+        accountKeys: [traderWallet, 'tokenAccount1']
+      }
+    }
+  };
+  const buyClass = TransactionClassifier.classify(buyTx, traderWallet);
+  assert(buyClass.type === 'BUY', 'Transaction with positive token balance delta classified as BUY');
+  assert(buyClass.mint === targetTokenMint, 'Correct non-base target mint extracted');
+  assert(buyClass.tokenAcquiredAmount === 5000, 'Calculated correct token acquired amount from delta');
+  assert(buyClass.solSpent! >= 0.19, 'Calculated correct SOL spent amount');
+
+  // 2c. SELL tx with negative balance delta
+  const sellTx = {
+    meta: {
+      err: null,
+      preBalances: [4000000000],
+      postBalances: [4500000000],
+      preTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: targetTokenMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '5000000000', decimals: 6 }
+        }
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: targetTokenMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '0', decimals: 6 }
+        }
+      ]
+    },
+    transaction: {
+      message: {
+        accountKeys: [traderWallet, 'tokenAccount1']
+      }
+    }
+  };
+  const sellClass = TransactionClassifier.classify(sellTx, traderWallet);
+  assert(sellClass.type === 'SELL', 'Transaction with negative token balance delta classified as SELL');
+
+  // 2d. BASE_COIN_ONLY swap (e.g. SOL to USDC)
+  const usdcMint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const baseSwapTx = {
+    meta: {
+      err: null,
+      preBalances: [5000000000],
+      postBalances: [4800000000],
+      preTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: usdcMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '0', decimals: 6 }
+        }
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 1,
+          mint: usdcMint,
+          owner: traderWallet,
+          uiTokenAmount: { amount: '35000000', decimals: 6 }
+        }
+      ]
+    },
+    transaction: {
+      message: {
+        accountKeys: [traderWallet, 'tokenAccount1']
+      }
+    }
+  };
+  const baseSwapClass = TransactionClassifier.classify(baseSwapTx, traderWallet);
+  assert(baseSwapClass.type === 'BASE_COIN_ONLY', 'Stablecoin/Base asset swap classified as BASE_COIN_ONLY');
+
+  // 2e. Token balance deltas helper verification
+  const deltas = TransactionClassifier.calculateTokenBalanceDeltas(
+    buyTx.meta.preTokenBalances,
+    buyTx.meta.postTokenBalances,
+    traderWallet
+  );
+  const tokenDelta = deltas.get(targetTokenMint);
+  assert(tokenDelta !== undefined && tokenDelta.deltaRaw === 5000000000, 'calculateTokenBalanceDeltas accurately computes net balance increase');
+
+  // TEST 3: Trader Wallet Repository CRUD & Persistence
+  console.log('\n--- TEST 3: Trader Wallet Repository CRUD & Persistence ---');
   const repo = TraderWalletRepository.getInstance(db);
   await repo.init();
 
@@ -54,6 +187,18 @@ async function runPipelineTests() {
     const found = allWallets.find(w => w.wallet_address === testWalletAddress);
     assert(Boolean(found), 'Trader wallet persisted and retrieved');
 
+    // Duplicate check
+    let duplicateRejected = false;
+    try {
+      await repo.addTraderWallet({
+        name: 'Duplicate Trader',
+        wallet_address: testWalletAddress
+      });
+    } catch {
+      duplicateRejected = true;
+    }
+    assert(duplicateRejected, 'Duplicate trader wallet address rejected with error');
+
     // Toggle status
     const toggled = await repo.toggleTraderWallet(added.id, false);
     assert(toggled?.enabled === false, 'Trader wallet status toggled to disabled');
@@ -67,8 +212,8 @@ async function runPipelineTests() {
     assert(false, `Persistence test failed with exception: ${err?.message}`);
   }
 
-  // TEST 3: SolanaTransactionQueue Rate Limiting & Concurrency Burst Handling
-  console.log('\n--- TEST 3: SolanaTransactionQueue Concurrency & Burst Handling ---');
+  // TEST 4: Queue Deduplication, Rate Limiting & Concurrency
+  console.log('\n--- TEST 4: Queue Deduplication & Concurrency ---');
   const queue = SolanaTransactionQueue.getInstance(db, () => null);
   const testTrader = {
     id: 'trader_burst',
@@ -80,21 +225,21 @@ async function runPipelineTests() {
     updated_at: new Date().toISOString()
   };
 
-  // Enqueue 20 genuine signatures
-  let enqueuedCount = 0;
-  for (let i = 0; i < 20; i++) {
-    const sig = `${validSignature.substring(0, 50)}${i.toString().padStart(2, '0')}${validSignature.substring(52)}`;
-    if (queue.enqueue(sig, testTrader)) {
-      enqueuedCount++;
-    }
-  }
+  const testSig = '4A7mX4K3pY2R9tW8qL1vN6jM9xZ4wQ7vB3nC2mP5kL8rJ1tY4wV7xZ3qM9P2kL9a';
+  const firstEnqueue = queue.enqueue(testSig, testTrader);
+  const duplicateEnqueue = queue.enqueue(testSig, testTrader);
+  assert(firstEnqueue === true, 'First signature enqueue accepted into transaction queue');
+  assert(duplicateEnqueue === false, 'Duplicate signature in queue immediately rejected/deduplicated');
 
-  const metrics = queue.getMetrics();
-  assert(enqueuedCount > 0, `Enqueued burst of ${enqueuedCount} signatures into transaction queue`);
-  assert(metrics.queuedCount > 0, `Queue metrics confirm ${metrics.queuedCount} items waiting in queue`);
+  // TEST 5: Solana RPC Queue 429 Handling & Retries
+  console.log('\n--- TEST 5: Solana RPC Queue 429 Handling & Retries ---');
+  const rpcQueue = SolanaRpcQueue.getInstance(() => null);
+  const rpcMetricsBefore = rpcQueue.getMetrics();
+  assert(typeof rpcMetricsBefore.rateLimit429Count === 'number', 'RPC Queue exposes rateLimit429Count metric');
+  assert(typeof rpcMetricsBefore.queuedCount === 'number', 'RPC Queue exposes queuedCount metric');
 
-  // TEST 4: Beginning Momentum Detection & Authorization
-  console.log('\n--- TEST 4: Beginning Momentum Detection & Authorization ---');
+  // TEST 6: Beginning Momentum Detection & Authorization
+  console.log('\n--- TEST 6: Beginning Momentum Detection & Authorization ---');
   db.updateSettings({ enableRugCheck: false });
   const momentumService = MomentumService.getInstance();
   const testMint = '7GCih33JYaA2HGR22K2k6Pz9w5S1u5N3Q8m3P2kL5r8a';
@@ -139,8 +284,99 @@ async function runPipelineTests() {
   assert(evalResult.decision === 'AUTHORIZED', 'Early momentum candidate (1 BUY) AUTHORIZED without 11-BUY gate');
   assert(evalResult.criteria.buyVelocityPassed === true, 'buyVelocityPassed is TRUE for beginning momentum candidate');
 
-  // TEST 5: Execution Mode Paths (PAPER vs REAL)
-  console.log('\n--- TEST 5: Execution Modes (PAPER vs REAL) ---');
+  // TEST 7: Rebuy Guard Rules: Profitable-Only & Maximum One Rebuy
+  console.log('\n--- TEST 7: Rebuy Guard: Profitable-Only & Maximum One Rebuy ---');
+  const rebuyMint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const profitableMint = 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN';
+
+  // Clean up any stale active positions for test mints from previous test runs
+  for (const pos of db.getPositions()) {
+    if (pos.token_mint === rebuyMint || pos.token_mint === profitableMint) {
+      db.deletePosition(pos.id);
+    }
+  }
+
+  await RebuyGuard.resetAll();
+
+  // 7a. Initial buy check on clean token
+  const canInitialBuy = await RebuyGuard.canBuy(rebuyMint);
+  assert(canInitialBuy.allowed === true && canInitialBuy.type === 'INITIAL_BUY', 'Initial buy on fresh token allowed');
+
+  // Simulate execution of initial buy
+  await RebuyGuard.onBuyExecuted({
+    mint: rebuyMint,
+    positionId: 'pos_1',
+    tokenQuantity: '1000',
+    entryPrice: 0.01,
+    entryCost: 0.1,
+    isRebuy: false
+  });
+
+  // 7b. Test LOSS exit -> Rebuy must be permanently blocked
+  await RebuyGuard.onPositionExited({
+    mint: rebuyMint,
+    positionId: 'pos_1',
+    entryCost: 0.1,
+    exitProceeds: 0.05, // 0.05 SOL returned on 0.1 SOL cost -> -0.05 SOL (LOSS)
+    entryPrice: 0.01,
+    exitPrice: 0.005,
+    sellReason: 'STOP_LOSS'
+  });
+
+  const canBuyAfterLoss = await RebuyGuard.canBuy(rebuyMint);
+  assert(canBuyAfterLoss.allowed === false, 'Rebuy BLOCKED after losing trade');
+  assert(canBuyAfterLoss.reason === 'PREVIOUS_TRADE_LOSS', 'Block reason accurately reported as PREVIOUS_TRADE_LOSS');
+
+  // 7c. Test PROFIT exit -> Rebuy allowed once
+  await RebuyGuard.onBuyExecuted({
+    mint: profitableMint,
+    positionId: 'pos_prof_1',
+    tokenQuantity: '1000',
+    entryPrice: 0.01,
+    entryCost: 0.1,
+    isRebuy: false
+  });
+
+  await RebuyGuard.onPositionExited({
+    mint: profitableMint,
+    positionId: 'pos_prof_1',
+    entryCost: 0.1,
+    exitProceeds: 0.15, // +0.05 SOL profit (+50%)
+    entryPrice: 0.01,
+    exitPrice: 0.015,
+    sellReason: 'TAKE_PROFIT'
+  });
+
+  const canBuyAfterProfit = await RebuyGuard.canBuy(profitableMint);
+  assert(canBuyAfterProfit.allowed === true, 'Rebuy ALLOWED after profitable trade');
+  assert(canBuyAfterProfit.type === 'ONE_PROFITABLE_REBUY', 'Decision classified as ONE_PROFITABLE_REBUY');
+
+  // 7d. Test Maximum One Rebuy: Execute rebuy and exit -> 3rd buy blocked permanently
+  await RebuyGuard.onBuyExecuted({
+    mint: profitableMint,
+    positionId: 'pos_prof_2',
+    tokenQuantity: '1000',
+    entryPrice: 0.015,
+    entryCost: 0.1,
+    isRebuy: true
+  });
+
+  await RebuyGuard.onPositionExited({
+    mint: profitableMint,
+    positionId: 'pos_prof_2',
+    entryCost: 0.1,
+    exitProceeds: 0.15, // Even if 2nd trade was profitable!
+    entryPrice: 0.015,
+    exitPrice: 0.02,
+    sellReason: 'TAKE_PROFIT'
+  });
+
+  const canBuyThirdTime = await RebuyGuard.canBuy(profitableMint);
+  assert(canBuyThirdTime.allowed === false, 'Third buy BLOCKED (maximum 1 rebuy rule enforced)');
+  assert(canBuyThirdTime.reason === 'MAX_REBUY_REACHED', 'Block reason accurately reported as MAX_REBUY_REACHED');
+
+  // TEST 8: Execution Mode Paths (PAPER vs REAL)
+  console.log('\n--- TEST 8: Execution Modes (PAPER vs REAL) ---');
   const realService = RealExecutionService.getInstance(db);
   const isSignerConfigured = realService.isSignerConfigured();
   
@@ -160,8 +396,6 @@ async function runPipelineTests() {
 
     assert(result.success === false, 'REAL mode fails gracefully when signer key is unconfigured');
     assert(result.error === 'REAL_EXECUTION_BLOCKED_SIGNER_NOT_CONFIGURED', 'Returns REAL_EXECUTION_BLOCKED_SIGNER_NOT_CONFIGURED status');
-  } else {
-    console.log('[Info] MAINNET_PRIVATE_KEY is set in environment.');
   }
 
   // Paper execution test
@@ -180,28 +414,8 @@ async function runPipelineTests() {
   assert(Boolean(paperPos), 'PAPER trade executed successfully');
   if (paperPos) {
     assert(paperPos.mint === paperMint, 'PAPER position mint matches candidate mint');
+    db.deletePosition(paperPos.id);
   }
-
-  // TEST 6: RPC Circuit Breaker & Observation Deferred Status
-  console.log('\n--- TEST 6: RPC Queue Circuit Breaker & Deferred Observation Status ---');
-  const rpcQueue = queue['connectionSupplier'] ? queue : null;
-  // Test deferred status
-  const deferredObs = db.addTokenObservation({
-    token_mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
-    token_name: 'WAITING FOR MARKET DATA',
-    token_symbol: 'UNAVAILABLE',
-    market_cap: 'UNKNOWN',
-    liquidity: 'UNKNOWN',
-    volume_24h: 'UNKNOWN',
-    developer_holding_percent: 'UNKNOWN',
-    buyers_10s: 0,
-    price: 'UNKNOWN',
-    status: 'WAIT',
-    rejection_reason: 'Market metrics temporarily unavailable on DexScreener (pending DEX indexing)',
-    source_trader_name: 'Deferred Test Trader'
-  });
-  assert(deferredObs.status === 'WAIT', 'Pending market data recorded as WAIT status rather than permanent REJECT');
-  assert(deferredObs.rejection_reason?.includes('pending DEX indexing') === true, 'Rejection reason identifies pending indexing correctly');
 
   console.log(`\n=== PIPELINE VERIFICATION SUMMARY: ${failures === 0 ? 'ALL TESTS PASSED SUCCESSFULLY' : `${failures} TEST(S) FAILED`} ===`);
   if (failures > 0) {

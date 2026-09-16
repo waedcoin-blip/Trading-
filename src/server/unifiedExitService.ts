@@ -2,21 +2,31 @@ import { Database } from '../db';
 import { Position, Trade, Settings } from '../types';
 import { aiLearningEngine } from './aiLearningEngine';
 import { RebuyGuard } from './rebuyGuard';
+import { Connection } from '@solana/web3.js';
+import { RealExecutionService } from './realExecutionService';
 
 export class UnifiedExitService {
   private static instance: UnifiedExitService;
   private db: Database;
+  private connectionSupplier: (() => Connection | null) | null = null;
   private exitingPositions: Set<string> = new Set();
 
-  private constructor(db: Database) {
+  private constructor(db: Database, connectionSupplier?: () => Connection | null) {
     this.db = db;
+    if (connectionSupplier) this.connectionSupplier = connectionSupplier;
   }
 
-  public static getInstance(db: Database): UnifiedExitService {
+  public static getInstance(db: Database, connectionSupplier?: () => Connection | null): UnifiedExitService {
     if (!UnifiedExitService.instance) {
-      UnifiedExitService.instance = new UnifiedExitService(db);
+      UnifiedExitService.instance = new UnifiedExitService(db, connectionSupplier);
+    } else if (connectionSupplier && !UnifiedExitService.instance.connectionSupplier) {
+      UnifiedExitService.instance.connectionSupplier = connectionSupplier;
     }
     return UnifiedExitService.instance;
+  }
+
+  public setConnectionSupplier(connectionSupplier: () => Connection | null): void {
+    this.connectionSupplier = connectionSupplier;
   }
 
   /**
@@ -162,6 +172,37 @@ export class UnifiedExitService {
 
     const decimals = typeof pos.tokenDecimals === 'number' ? pos.tokenDecimals : (pos.token_decimals || 6);
     const remainingNum = this.parseTokenQuantity(pos.remainingTokenQuantity || pos.tokenQuantity);
+    const settings = this.db.getSettings();
+    const isRealMode = settings.trading_mode === 'MAINNET' || settings.mainnet_enabled === true;
+
+    let actualSellSignature = pos.buy_signature + '_exit_' + Date.now();
+    let actualSolOut = solOut;
+    let actualPnlSol = pnlSol;
+    let actualPnlPercent = pnlPercent;
+
+    // In REAL mode, perform on-chain execution first
+    if (isRealMode) {
+      const conn = this.connectionSupplier ? this.connectionSupplier() : null;
+      console.log(`[Exit Engine] Initiating REAL on-chain SELL for ${pos.token_symbol} (${pos.token_mint})...`);
+      const sellResult = await RealExecutionService.getInstance(this.db).executeSell(
+        pos.token_mint,
+        remainingNum,
+        decimals,
+        conn
+      );
+
+      if (!sellResult.success) {
+        console.error(`[Exit Engine] REAL on-chain SELL failed for ${pos.token_symbol}: ${sellResult.error} (${sellResult.details})`);
+        return null;
+      }
+
+      actualSellSignature = sellResult.signature || actualSellSignature;
+      if (typeof sellResult.solOut === 'number' && sellResult.solOut > 0) {
+        actualSolOut = Number(sellResult.solOut.toFixed(4));
+        actualPnlSol = Number((actualSolOut - pos.sol_in).toFixed(4));
+        actualPnlPercent = pos.sol_in > 0 ? Number(((actualPnlSol / pos.sol_in) * 100).toFixed(2)) : 0;
+      }
+    }
 
     // 1. Mark position as SOLD
     this.db.updatePosition(pos.id, { 
@@ -173,11 +214,11 @@ export class UnifiedExitService {
     // Remove from active list
     this.db.deletePosition(pos.id);
 
-    const settings = this.db.getSettings();
-
-    // 2. Restore paper balance with output SOL
-    const updatedBalance = Number((settings.paper_balance_sol + solOut).toFixed(4));
-    this.db.updateSettings({ paper_balance_sol: updatedBalance });
+    // 2. Restore paper balance with output SOL if paper mode
+    if (!isRealMode) {
+      const updatedBalance = Number((settings.paper_balance_sol + actualSolOut).toFixed(4));
+      this.db.updateSettings({ paper_balance_sol: updatedBalance });
+    }
 
     // 3. Record completed trade
     const completedTrade = this.db.addTrade({
@@ -188,20 +229,20 @@ export class UnifiedExitService {
       source_trader_id: pos.source_trader_id,
       source_trader_name: pos.source_trader_name,
       buy_signature: pos.buy_signature,
-      sell_signature: pos.buy_signature + '_exit_' + Date.now(),
+      sell_signature: actualSellSignature,
       sol_in: pos.sol_in,
       token_amount_bought: this.parseTokenQuantity(pos.tokenQuantity),
       tokenQuantityBought: pos.tokenQuantity,
       token_amount_sold: remainingNum,
       tokenQuantitySold: this.formatTokenQuantity(remainingNum, decimals),
       remainingQuantity: '0',
-      sol_out: solOut,
+      sol_out: actualSolOut,
       entry_price: pos.entry_price,
       exit_price: exitPrice,
       buy_time: pos.buy_time,
       sell_time: new Date().toISOString(),
-      pnl_sol: pnlSol,
-      pnl_percent: pnlPercent,
+      pnl_sol: actualPnlSol,
+      pnl_percent: actualPnlPercent,
       sell_reason: reason,
       mode: settings.trading_mode
     });

@@ -21,19 +21,29 @@ export class TraderWalletRepository {
   private dbFallback: Database;
   private isPgAvailable = false;
   private monitoringStatuses: Map<string, TraderMonitoringStatus> = new Map();
+  private isProductionEnv = false;
 
   constructor(dbFallback: Database) {
     this.dbFallback = dbFallback;
+    this.isProductionEnv = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER) || Boolean(process.env.RENDER_SERVICE_ID);
+
     const dbUrl = process.env.DATABASE_URL;
+    if (this.isProductionEnv && (!dbUrl || dbUrl.trim() === '')) {
+      throw new Error('[TraderWalletRepository] CONFIGURATION_ERROR: DATABASE_URL is missing in production/Render environment. PostgreSQL is required for trader wallet persistence.');
+    }
+
     if (dbUrl && dbUrl.trim() !== '') {
       try {
         this.pool = new pg.Pool({
           connectionString: dbUrl.trim(),
-          ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+          ssl: this.isProductionEnv ? { rejectUnauthorized: false } : undefined,
         });
         this.isPgAvailable = true;
-      } catch (err) {
-        console.error('[TraderWalletRepository] Failed to initialize PostgreSQL pool, using JSON fallback:', err);
+      } catch (err: any) {
+        if (this.isProductionEnv) {
+          throw new Error(`[TraderWalletRepository] CRITICAL: Failed to initialize PostgreSQL pool in production: ${err?.message}`);
+        }
+        console.error('[TraderWalletRepository] Failed to initialize PostgreSQL pool in development, using JSON fallback:', err);
         this.isPgAvailable = false;
       }
     }
@@ -51,7 +61,10 @@ export class TraderWalletRepository {
    */
   public async init(): Promise<void> {
     if (!this.isPgAvailable || !this.pool) {
-      console.log('[TraderWalletRepository] Operating in JSON fallback storage mode (DATABASE_URL not set).');
+      if (this.isProductionEnv) {
+        throw new Error('[TraderWalletRepository] CONFIGURATION_ERROR: PostgreSQL pool is not available in production environment.');
+      }
+      console.log('[TraderWalletRepository] Operating in JSON development storage mode (DATABASE_URL not set).');
       this.syncMonitoringStatusesFromMemory(this.dbFallback.getTraderWallets());
       return;
     }
@@ -67,6 +80,7 @@ export class TraderWalletRepository {
           created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trader_wallets_address ON trader_wallets(wallet_address);
       `);
 
       console.log('[TraderWalletRepository] PostgreSQL trader_wallets table initialized successfully.');
@@ -96,15 +110,44 @@ export class TraderWalletRepository {
 
       const currentWallets = await this.getTraderWallets();
       this.syncMonitoringStatusesFromMemory(currentWallets);
-    } catch (err) {
-      console.error('[TraderWalletRepository] Error initializing PostgreSQL table / migration:', err);
+    } catch (err: any) {
+      if (this.isProductionEnv) {
+        throw new Error(`[TraderWalletRepository] CRITICAL: PostgreSQL initialization failed in production: ${err?.message}`);
+      }
+      console.error('[TraderWalletRepository] Error initializing PostgreSQL table in development:', err);
       this.isPgAvailable = false;
       this.syncMonitoringStatusesFromMemory(this.dbFallback.getTraderWallets());
     }
   }
 
   public isPostgresActive(): boolean {
-    return this.isPgAvailable;
+    return this.isPgAvailable && this.pool !== null;
+  }
+
+  public getStorageMode(): 'postgres' | 'json' | 'dev' {
+    if (this.isPostgresActive()) return 'postgres';
+    return this.isProductionEnv ? 'postgres' : 'dev';
+  }
+
+  public isProduction(): boolean {
+    return this.isProductionEnv;
+  }
+
+  public getTraderWalletCount(): number {
+    return this.monitoringStatuses.size;
+  }
+
+  public getEnabledTraderWalletCount(): number {
+    let count = 0;
+    for (const s of this.monitoringStatuses.values()) {
+      if (s.subscriptionStatus !== 'IDLE') count++;
+    }
+    return count;
+  }
+
+  public getDbStatus(): 'connected' | 'disconnected' {
+    if (this.isPostgresActive()) return 'connected';
+    return this.isProductionEnv ? 'disconnected' : 'connected';
   }
 
   public async getTraderWallets(): Promise<TraderWallet[]> {
@@ -120,8 +163,11 @@ export class TraderWalletRepository {
           created_at: typeof row.created_at === 'object' ? row.created_at.toISOString() : String(row.created_at),
           updated_at: typeof row.updated_at === 'object' ? row.updated_at.toISOString() : String(row.updated_at)
         }));
-      } catch (err) {
-        console.error('[TraderWalletRepository] Error fetching wallets from PostgreSQL, falling back to JSON:', err);
+      } catch (err: any) {
+        if (this.isProductionEnv) {
+          throw new Error(`[TraderWalletRepository] CRITICAL: Failed to query PostgreSQL in production: ${err?.message}`);
+        }
+        console.error('[TraderWalletRepository] Error fetching wallets from PostgreSQL in development:', err);
       }
     }
     return this.dbFallback.getTraderWallets();
@@ -134,7 +180,7 @@ export class TraderWalletRepository {
       throw new Error('Invalid Solana Public Key wallet address.');
     }
 
-    // Check duplicate address in database
+    // Check duplicate address
     const existingWallets = await this.getTraderWallets();
     if (existingWallets.some(w => w.wallet_address.trim() === normalizedAddress)) {
       throw new Error(`Trader wallet with address ${normalizedAddress} is already registered.`);
@@ -155,21 +201,40 @@ export class TraderWalletRepository {
 
     if (this.isPgAvailable && this.pool) {
       try {
-        await this.pool.query(
+        const res = await this.pool.query(
           `INSERT INTO trader_wallets (id, user_id, name, wallet_address, enabled, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
           [newWallet.id, newWallet.user_id, newWallet.name, newWallet.wallet_address, newWallet.enabled, newWallet.created_at, newWallet.updated_at]
         );
+        const row = res.rows[0];
+        const persistedWallet: TraderWallet = {
+          id: row.id,
+          user_id: row.user_id,
+          name: row.name,
+          wallet_address: row.wallet_address,
+          enabled: Boolean(row.enabled),
+          created_at: typeof row.created_at === 'object' ? row.created_at.toISOString() : String(row.created_at),
+          updated_at: typeof row.updated_at === 'object' ? row.updated_at.toISOString() : String(row.updated_at)
+        };
+
+        // Mirror in local fallback cache for instant sync
+        this.dbFallback.addTraderWallet(persistedWallet);
+        this.syncSingleMonitoringStatus(persistedWallet);
+        return persistedWallet;
       } catch (err: any) {
         console.error('[TraderWalletRepository] Failed to insert wallet into PostgreSQL:', err);
         if (err?.code === '23505') {
           throw new Error(`Trader wallet address ${normalizedAddress} already exists in database.`);
         }
+        if (this.isProductionEnv) {
+          throw new Error(`[TraderWalletRepository] CRITICAL: PostgreSQL insert failed in production: ${err?.message}`);
+        }
         throw err;
       }
     }
 
-    // Always mirror in db.json for consistency & fallback
+    // Development without PostgreSQL: persist to dbFallback
     this.dbFallback.addTraderWallet({
       id: newWallet.id,
       name: newWallet.name,
@@ -177,18 +242,7 @@ export class TraderWalletRepository {
       enabled: newWallet.enabled
     });
 
-    this.updateTraderMonitoringStatus(newWallet.id, {
-      traderId: newWallet.id,
-      traderName: newWallet.name,
-      walletAddress: newWallet.wallet_address,
-      rpcEndpointName: this.getSanitizedRpcEndpoint(),
-      subscriptionId: null,
-      subscriptionStatus: newWallet.enabled ? 'CONNECTED' : 'IDLE',
-      lastDetectedSignature: null,
-      lastProcessedTimestamp: null,
-      lastError: null
-    });
-
+    this.syncSingleMonitoringStatus(newWallet);
     return newWallet;
   }
 
@@ -202,17 +256,36 @@ export class TraderWalletRepository {
 
     if (this.isPgAvailable && this.pool) {
       try {
-        await this.pool.query(
-          `UPDATE trader_wallets SET enabled = $1, updated_at = $2 WHERE id = $3`,
+        const res = await this.pool.query(
+          `UPDATE trader_wallets SET enabled = $1, updated_at = $2 WHERE id = $3 RETURNING *`,
           [newEnabled, now, id]
         );
-      } catch (err) {
-        console.error('[TraderWalletRepository] Failed to update wallet in PostgreSQL:', err);
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          const persisted: TraderWallet = {
+            id: row.id,
+            user_id: row.user_id,
+            name: row.name,
+            wallet_address: row.wallet_address,
+            enabled: Boolean(row.enabled),
+            created_at: typeof row.created_at === 'object' ? row.created_at.toISOString() : String(row.created_at),
+            updated_at: typeof row.updated_at === 'object' ? row.updated_at.toISOString() : String(row.updated_at)
+          };
+          this.dbFallback.updateTraderWallet(id, { enabled: newEnabled });
+          this.updateTraderMonitoringStatus(id, {
+            subscriptionStatus: newEnabled ? 'CONNECTED' : 'IDLE'
+          });
+          return persisted;
+        }
+      } catch (err: any) {
+        if (this.isProductionEnv) {
+          throw new Error(`[TraderWalletRepository] CRITICAL: PostgreSQL update failed in production: ${err?.message}`);
+        }
+        console.error('[TraderWalletRepository] Failed to update wallet in PostgreSQL in development:', err);
       }
     }
 
     this.dbFallback.updateTraderWallet(id, { enabled: newEnabled });
-
     this.updateTraderMonitoringStatus(id, {
       subscriptionStatus: newEnabled ? 'CONNECTED' : 'IDLE'
     });
@@ -230,8 +303,11 @@ export class TraderWalletRepository {
       try {
         const res = await this.pool.query('DELETE FROM trader_wallets WHERE id = $1', [id]);
         deleted = (res.rowCount ?? 0) > 0;
-      } catch (err) {
-        console.error('[TraderWalletRepository] Failed to delete wallet from PostgreSQL:', err);
+      } catch (err: any) {
+        if (this.isProductionEnv) {
+          throw new Error(`[TraderWalletRepository] CRITICAL: PostgreSQL delete failed in production: ${err?.message}`);
+        }
+        console.error('[TraderWalletRepository] Failed to delete wallet from PostgreSQL in development:', err);
       }
     }
 
@@ -239,6 +315,20 @@ export class TraderWalletRepository {
     this.monitoringStatuses.delete(id);
 
     return deleted || jsonDeleted;
+  }
+
+  private syncSingleMonitoringStatus(wallet: TraderWallet): void {
+    this.updateTraderMonitoringStatus(wallet.id, {
+      traderId: wallet.id,
+      traderName: wallet.name,
+      walletAddress: wallet.wallet_address,
+      rpcEndpointName: this.getSanitizedRpcEndpoint(),
+      subscriptionId: null,
+      subscriptionStatus: wallet.enabled ? 'CONNECTED' : 'IDLE',
+      lastDetectedSignature: null,
+      lastProcessedTimestamp: null,
+      lastError: null
+    });
   }
 
   // --- Monitoring Health Status Tracker ---

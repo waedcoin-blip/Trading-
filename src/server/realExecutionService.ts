@@ -103,21 +103,40 @@ export class RealExecutionService {
     const userPubkey = keypair.publicKey.toBase58();
     const solMint = 'So11111111111111111111111111111111111111112';
 
+    // 2. Check wallet balance before execution
+    try {
+      const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
+      const balanceLamports = await rpcQueue.getBalance(keypair.publicKey, 'confirmed', 'HIGH');
+      const requiredLamports = solLamports + 10000000; // trade amount + 0.01 SOL buffer for gas and rent
+      if (balanceLamports < requiredLamports) {
+        console.error(`[RealExecution] Insufficient balance: ${(balanceLamports / 1e9).toFixed(4)} SOL available, requires ${(requiredLamports / 1e9).toFixed(4)} SOL.`);
+        return {
+          success: false,
+          error: 'EXECUTION_INSUFFICIENT_SOL',
+          details: `Wallet balance (${(balanceLamports / 1e9).toFixed(4)} SOL) is insufficient for trade of ${tradeAmountSol} SOL plus fees.`
+        };
+      }
+    } catch (balErr: any) {
+      console.warn('[RealExecution] Failed to verify wallet balance before trade, proceeding with caution:', balErr?.message);
+    }
+
     console.log(`[RealExecution] Initiating REAL mainnet trade for ${tokenSymbol} (${mint}). Wallet: ${userPubkey}`);
 
-    // 2. Fetch Jupiter Quote
+    // 3. Fetch Jupiter Quote
     let quote: any = null;
     try {
       quote = await jupiterService.getQuote(solMint, mint, solLamports, 100);
     } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      const isSlippage = errMsg.toLowerCase().includes('slippage') || errMsg.toLowerCase().includes('exceeded');
       return {
         success: false,
-        error: 'JUPITER_QUOTE_FAILED',
-        details: err?.message || 'Failed to acquire Jupiter swap quote'
+        error: isSlippage ? 'JUPITER_SLIPPAGE_EXCEEDED' : 'JUPITER_QUOTE_FAILED',
+        details: errMsg || 'Failed to acquire Jupiter swap quote'
       };
     }
 
-    // 3. Build Swap Transaction
+    // 4. Build Swap Transaction
     let swapTxBase64 = '';
     try {
       swapTxBase64 = await jupiterService.buildSwapTransaction(quote, userPubkey);
@@ -129,7 +148,7 @@ export class RealExecutionService {
       };
     }
 
-    // 4. Sign and Broadcast Transaction
+    // 5. Sign and Broadcast Transaction
     let txSignature = '';
     try {
       const swapTxBuf = Buffer.from(swapTxBase64, 'base64');
@@ -154,7 +173,7 @@ export class RealExecutionService {
       };
     }
 
-    // 5. Confirm Transaction
+    // 6. Confirm Transaction
     try {
       const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
       const confirmation = await rpcQueue.confirmTransaction(txSignature, 'confirmed', 'HIGH');
@@ -175,10 +194,9 @@ export class RealExecutionService {
       };
     }
 
-    // 6. Record Position upon successful execution
+    // 7. Record Position upon successful execution
     const acquiredTokens = quote?.outAmount ? Number(quote.outAmount) / Math.pow(10, decimals) : (solLamports / (priceSol * 1e9));
     const tokenQuantity = formatTokenQuantity(acquiredTokens, decimals);
-    const entryPriceUsd = priceSol * 160.0; // Estimate or current SOL price
 
     const newPosition = this.db.addPosition({
       token_mint: mint,
@@ -205,6 +223,130 @@ export class RealExecutionService {
       success: true,
       signature: txSignature,
       details: `REAL TRADE CONFIRMED: ${tokenQuantity} ${tokenSymbol} bought for ${tradeAmountSol} SOL`
+    };
+  }
+
+  /**
+   * Executes a REAL on-chain SELL through Jupiter swap back into SOL.
+   */
+  public async executeSell(
+    mint: string,
+    tokenAmount: number | string,
+    decimals: number,
+    connection: Connection | null
+  ): Promise<{ success: boolean; signature?: string; solOut?: number; error?: string; details?: string }> {
+    const keypair = this.getSignerKeypair();
+    if (!keypair) {
+      return {
+        success: false,
+        error: 'REAL_EXECUTION_BLOCKED_SIGNER_NOT_CONFIGURED',
+        details: 'MAINNET_PRIVATE_KEY is not configured on the server.'
+      };
+    }
+
+    if (!connection) {
+      return {
+        success: false,
+        error: 'JUPITER_SEND_FAILED',
+        details: 'No active Solana RPC connection available.'
+      };
+    }
+
+    const userPubkey = keypair.publicKey.toBase58();
+    const solMint = 'So11111111111111111111111111111111111111112';
+
+    // Parse token quantity to raw integer units
+    const numericAmount = typeof tokenAmount === 'string' ? parseFloat(tokenAmount.replace(/,/g, '')) : tokenAmount;
+    if (isNaN(numericAmount) || numericAmount <= 0) {
+      return {
+        success: false,
+        error: 'INVALID_TOKEN_AMOUNT',
+        details: 'Token amount to sell must be greater than zero.'
+      };
+    }
+
+    const rawUnits = Math.floor(numericAmount * Math.pow(10, decimals));
+
+    console.log(`[RealExecution] Initiating REAL on-chain SELL of ${numericAmount} tokens (${mint}) for wallet ${userPubkey}`);
+
+    // 1. Fetch quote for Token -> SOL
+    let quote: any = null;
+    try {
+      quote = await jupiterService.getQuote(mint, solMint, rawUnits, 150);
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      const isSlippage = errMsg.toLowerCase().includes('slippage') || errMsg.toLowerCase().includes('exceeded');
+      return {
+        success: false,
+        error: isSlippage ? 'JUPITER_SLIPPAGE_EXCEEDED' : 'JUPITER_QUOTE_FAILED',
+        details: errMsg
+      };
+    }
+
+    // 2. Build swap transaction
+    let swapTxBase64 = '';
+    try {
+      swapTxBase64 = await jupiterService.buildSwapTransaction(quote, userPubkey);
+    } catch (err: any) {
+      return {
+        success: false,
+        error: 'JUPITER_SWAP_BUILD_FAILED',
+        details: err?.message || 'Failed to construct Jupiter sell transaction'
+      };
+    }
+
+    // 3. Sign and Broadcast Transaction
+    let txSignature = '';
+    try {
+      const swapTxBuf = Buffer.from(swapTxBase64, 'base64');
+      const transaction = VersionedTransaction.deserialize(swapTxBuf);
+
+      transaction.sign([keypair]);
+      const rawTx = transaction.serialize();
+
+      const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
+      txSignature = await rpcQueue.sendRawTransaction(rawTx, {
+        skipPreflight: false,
+        maxRetries: 3
+      }, 'HIGH');
+
+      console.log(`[RealExecution] SELL transaction submitted. Signature: ${txSignature}`);
+    } catch (err: any) {
+      return {
+        success: false,
+        error: 'JUPITER_SEND_FAILED',
+        details: err?.message || 'Failed to broadcast sell transaction'
+      };
+    }
+
+    // 4. Confirm Transaction
+    try {
+      const rpcQueue = SolanaRpcQueue.getInstance(() => connection);
+      const confirmation = await rpcQueue.confirmTransaction(txSignature, 'confirmed', 'HIGH');
+      if (confirmation.value.err) {
+        return {
+          success: false,
+          signature: txSignature,
+          error: 'JUPITER_CONFIRMATION_FAILED',
+          details: `Transaction confirmed with on-chain error: ${JSON.stringify(confirmation.value.err)}`
+        };
+      }
+    } catch (err: any) {
+      return {
+        success: false,
+        signature: txSignature,
+        error: 'JUPITER_CONFIRMATION_FAILED',
+        details: err?.message || 'Confirmation timed out'
+      };
+    }
+
+    const solOut = quote?.outAmount ? Number(quote.outAmount) / 1e9 : 0;
+    console.log(`[RealExecution] REAL SELL confirmed on-chain! Output: ${solOut.toFixed(4)} SOL. Signature: ${txSignature}`);
+
+    return {
+      success: true,
+      signature: txSignature,
+      solOut
     };
   }
 }

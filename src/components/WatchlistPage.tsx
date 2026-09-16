@@ -365,7 +365,7 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
                           </span>
                         </div>
                         <div>
-                          <span className="text-[#6b7280] block text-[10px]">BUYERS / 10s</span>
+                          <span className="text-[#6b7280] block text-[10px]">BUY TX / 10s</span>
                           <span className="text-[#f3f4f6] font-semibold">
                             {obs.buyers_10s === 'UNKNOWN' ? 'UNAVAILABLE' : `${obs.buyers_10s}`}
                           </span>

@@ -124,12 +124,70 @@ app.post('/api/discovery/refresh', async (req, res) => {
 
 // API: Health endpoint for Render & local health checks
 app.get(['/health', '/api/health'], (req, res) => {
+  const repo = TraderWalletRepository.getInstance(db);
+  const rpcQueue = SolanaRpcQueue.getInstance(() => solanaConnection);
+  const txQueue = SolanaTransactionQueue.getInstance(db, () => solanaConnection);
+  const rpcMetrics = rpcQueue.getMetrics();
+  const txMetrics = txQueue.getMetrics();
+  const settings = db.getSettings();
+
+  const rpcStatus = currentConnectionStatus.rpc === 'CONNECTED'
+    ? (rpcMetrics.circuitBreakerActive || rpcMetrics.rateLimit429Count > 0 ? 'DEGRADED' : 'CONNECTED')
+    : 'DISCONNECTED';
+
   res.json({
     status: 'ok',
     service: 'trading-server',
     uptimeSec: Math.floor(process.uptime()),
+    database: {
+      type: repo.getStorageMode() === 'postgres' ? 'postgres' : 'json',
+      connected: repo.getDbStatus() === 'connected',
+      traderWalletCount: repo.getTraderWalletCount()
+    },
+    solanaRpc: {
+      status: rpcStatus,
+      circuitBreakerActive: rpcMetrics.circuitBreakerActive,
+      activeRequests: rpcMetrics.activeWorkers,
+      recent429Count: rpcMetrics.rateLimit429Count,
+      queueDepth: rpcMetrics.queuedCount,
+      avgLatencyMs: rpcMetrics.avgFetchLatencyMs
+    },
+    txQueue: {
+      queued: txMetrics.queuedCount,
+      processing: txMetrics.activeWorkers,
+      completed: txMetrics.completedCount,
+      retrying: txMetrics.retriesCount,
+      failed: txMetrics.failedPermanentlyCount
+    },
+    monitoring: {
+      activeSubscriptions: activeLogSubscriptions.length,
+      enabledTraders: repo.getEnabledTraderWalletCount()
+    },
+    trading: {
+      mode: settings.trading_mode || 'PAPER',
+      signerConfigured: RealExecutionService.getInstance(db).isSignerConfigured(),
+      activePositions: db.getPositions().filter(p => p.status === 'ACTIVE').length
+    },
     timestamp: Date.now()
   });
+});
+
+// API: Trader Wallets list with persistence metadata
+app.get('/api/trader-wallets', async (req, res) => {
+  try {
+    const repo = TraderWalletRepository.getInstance(db);
+    const wallets = await repo.getTraderWallets();
+    const monitoring = repo.getMonitoringStatuses();
+    res.json({
+      success: true,
+      database: repo.getDbStatus(),
+      traderWalletRepository: repo.getStorageMode(),
+      wallets,
+      monitoring
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Failed to fetch trader wallets' });
+  }
 });
 
 // API: Real Jupiter V3 Health Diagnostic Endpoint
@@ -337,10 +395,10 @@ app.post('/api/action', async (req, res) => {
     else if (actionType === 'TOGGLE_TRADER') {
       try {
         const repo = TraderWalletRepository.getInstance(db);
-        await repo.toggleTraderWallet(data.id, data.enabled);
+        const toggled = await repo.toggleTraderWallet(data.id, data.enabled);
         await setupLogsSubscription();
         await broadcastState();
-        res.json({ success: true });
+        res.json({ success: true, trader: toggled });
       } catch (err: any) {
         res.status(400).json({ success: false, error: err?.message || 'Failed to toggle trader' });
       }
@@ -351,7 +409,7 @@ app.post('/api/action', async (req, res) => {
         await repo.deleteTraderWallet(data.id);
         await setupLogsSubscription();
         await broadcastState();
-        res.json({ success: true });
+        res.json({ success: true, id: data.id });
       } catch (err: any) {
         res.status(400).json({ success: false, error: err?.message || 'Failed to delete trader' });
       }
@@ -469,20 +527,6 @@ let currentConnectionStatus: ConnectionStatus = {
   laserstream: 'DISCONNECTED',
   jupiter: 'NOT_CONFIGURED'
 };
-
-// Bounded set of processed transaction signatures to avoid duplicate copy trading (Idempotency)
-const MAX_PROCESSED_SIGNATURES = 50000;
-const processedSignatures = new Set<string>();
-
-function markSignatureSeen(sig: string): boolean {
-  if (processedSignatures.has(sig)) return false;
-  if (processedSignatures.size >= MAX_PROCESSED_SIGNATURES) {
-    const oldest = processedSignatures.values().next().value;
-    if (oldest) processedSignatures.delete(oldest);
-  }
-  processedSignatures.add(sig);
-  return true;
-}
 
 // Solana Connection instances
 let solanaConnection: Connection | null = null;
@@ -612,7 +656,10 @@ async function setupLogsSubscription() {
       const subId = solanaConnection.onLogs(
         pubkey,
         async (logs) => {
-          if (!logs.signature || !markSignatureSeen(logs.signature)) return;
+          if (!logs.signature) return;
+          const enqueued = SolanaTransactionQueue.getInstance(db, () => solanaConnection).enqueue(logs.signature, trader);
+          if (!enqueued) return;
+
           console.log(`[Solana] Real on-chain log event detected on wallet ${trader.name} (${trader.wallet_address}). Signature: ${logs.signature}`);
           
           repo.updateTraderMonitoringStatus(trader.id, {
@@ -621,9 +668,6 @@ async function setupLogsSubscription() {
             subscriptionStatus: 'MONITORING',
             lastError: null
           });
-
-          // Enqueue transaction signature into rate-limited, concurrency-controlled queue
-          SolanaTransactionQueue.getInstance(db, () => solanaConnection).enqueue(logs.signature, trader);
         },
         'confirmed'
       );
@@ -1115,7 +1159,7 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
     if (exitingPositions.has(pos.id)) continue;
 
     // 1. Let UnifiedExitService evaluate triggers and execute exits
-    UnifiedExitService.getInstance(db).evaluateExitTriggers(
+    UnifiedExitService.getInstance(db, () => solanaConnection).evaluateExitTriggers(
       pos,
       livePrice.priceSol,
       livePrice.isStale,
@@ -1164,7 +1208,7 @@ async function executePartialSell(
 ) {
   if (sellRatio >= 1) {
     // 100% full exit
-    await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+    await UnifiedExitService.getInstance(db, () => solanaConnection).executeManualExit(pos, pos.current_price, () => {
       broadcastState();
     });
     return;
@@ -1177,7 +1221,7 @@ async function executePartialSell(
   const newRemainingNum = Math.max(0, Number((currentRemainingNum - tokensToSellNum).toFixed(decimals)));
 
   if (newRemainingNum <= 0) {
-    await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
+    await UnifiedExitService.getInstance(db, () => solanaConnection).executeManualExit(pos, pos.current_price, () => {
       broadcastState();
     });
     return;

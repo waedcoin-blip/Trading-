@@ -123,16 +123,30 @@ export class BuyAuthorizationService {
     const developerPassed = devHolding < 5;
 
     // Beginning-Momentum Authorization Rule:
-    // Requires at least 1 recorded BUY in the monitoring window AND positive/increasing momentum signals.
-    const minBuyActivityPassed = velocity30s >= 1 || velocity10s >= 1;
-    const momentumIncreasingPassed =
-      momentum.earlyMomentumDetected ||
-      momentum.buyTxIncreasing ||
-      momentum.buyVelocityIncreasing ||
-      momentum.volumeIncreasing ||
-      momentum.priceMovingPositively;
+    const windowSeconds = parseInt(process.env.MOMENTUM_WINDOW_SECONDS || '10', 10);
+    const minBuys = parseInt(process.env.MOMENTUM_MIN_BUYS || '1', 10);
+    const maxBuysCeiling = parseInt(process.env.MOMENTUM_MAX_BUYS_CEILING || '10', 10);
+    const requireAcceleration = process.env.MOMENTUM_REQUIRE_ACCELERATION !== 'false';
 
-    const buyVelocityPassed = minBuyActivityPassed && momentumIncreasingPassed;
+    let buysInWindow = velocity10s;
+    if (windowSeconds <= 5) {
+      buysInWindow = momentum.buyTxCount5s;
+    } else if (windowSeconds > 30) {
+      buysInWindow = momentum.buyTxCount60s;
+    } else if (windowSeconds > 10) {
+      buysInWindow = velocity30s;
+    }
+
+    let momentumRejectReason: string | null = null;
+    if (buysInWindow >= maxBuysCeiling) {
+      momentumRejectReason = 'MOMENTUM_EXHAUSTION';
+    } else if (buysInWindow < minBuys) {
+      momentumRejectReason = 'MOMENTUM_INSUFFICIENT';
+    } else if (requireAcceleration && !momentum.buyVelocityIncreasing && !momentum.earlyMomentumDetected && !momentum.buyTxIncreasing) {
+      momentumRejectReason = 'MOMENTUM_ACCELERATION_MISSING';
+    }
+
+    const buyVelocityPassed = momentumRejectReason === null;
 
     const criteriaPassed = marketCapPassed && liquidityPassed && volumePassed && developerPassed && buyVelocityPassed;
 
@@ -163,7 +177,7 @@ export class BuyAuthorizationService {
     if (!liquidityPassed) rejectReasons.push('LIQUIDITY_TOO_LOW');
     if (!volumePassed) rejectReasons.push('VOLUME_TOO_LOW');
     if (!developerPassed) rejectReasons.push('DEVELOPER_HOLDING_TOO_HIGH');
-    if (!buyVelocityPassed) rejectReasons.push('BEGINNING_MOMENTUM_NOT_MET');
+    if (!buyVelocityPassed && momentumRejectReason) rejectReasons.push(momentumRejectReason);
     if (!rugcheckPassed) {
       const details = securityRejectReasons.length > 0 ? `: ${securityRejectReasons.join(', ')}` : '';
       rejectReasons.push(`SECURITY_GATE_FAILED${details}`);

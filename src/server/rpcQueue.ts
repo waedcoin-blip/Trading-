@@ -27,6 +27,15 @@ export interface InternalRpcTask<T = any> {
 }
 
 export interface RpcQueueMetrics {
+  rpcRequests: number;
+  rpcSuccess: number;
+  rpc429: number;
+  rpcErrors: number;
+  rpcRetries: number;
+  rpcQueueDepth: number;
+  rpcActiveRequests: number;
+  rpcCircuitOpen: boolean;
+  transactionQueueDepth?: number;
   queuedCount: number;
   activeWorkers: number;
   completedCount: number;
@@ -49,6 +58,8 @@ export class SolanaRpcQueue {
   private concurrency: number;
   private maxRequestsPerSecond: number;
   private maxRetries: number;
+  private backoffBaseMs: number;
+  private backoffMaxMs: number;
 
   // Task queue & state
   private queuedTasks: InternalRpcTask[] = [];
@@ -62,6 +73,7 @@ export class SolanaRpcQueue {
   private circuitBreakerTimer: NodeJS.Timeout | null = null;
 
   // Rolling metrics counters
+  private totalRequests = 0;
   private totalCompleted = 0;
   private totalRetries = 0;
   private total429Count = 0;
@@ -76,6 +88,8 @@ export class SolanaRpcQueue {
     this.concurrency = parseInt(process.env.RPC_MAX_CONCURRENCY || '3', 10);
     this.maxRequestsPerSecond = parseInt(process.env.RPC_MAX_REQUESTS_PER_SECOND || '5', 10);
     this.maxRetries = parseInt(process.env.RPC_MAX_RETRIES || '5', 10);
+    this.backoffBaseMs = parseInt(process.env.RPC_BACKOFF_BASE_MS || '500', 10);
+    this.backoffMaxMs = parseInt(process.env.RPC_BACKOFF_MAX_MS || '10000', 10);
 
     // Periodic cleanup loop for old timestamp counters
     setInterval(() => this.pruneTimestamps(), 10000);
@@ -99,6 +113,12 @@ export class SolanaRpcQueue {
     options: RpcTaskOptions
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      // Bounded backpressure: prevent unbounded memory consumption
+      if (this.queuedTasks.length >= 500) {
+        reject(new Error('RPC_QUEUE_OVERFLOW: Queue depth exceeded limit of 500.'));
+        return;
+      }
+
       const id = 'rpc_' + Math.random().toString(36).substring(2, 11);
       const now = Date.now();
       const traderWalletAddress = options.traderWalletAddress ? options.traderWalletAddress.trim() : 'GLOBAL';
@@ -219,6 +239,33 @@ export class SolanaRpcQueue {
     );
   }
 
+  public async getBalance(
+    publicKey: PublicKey,
+    commitment?: any,
+    priority: RpcTaskPriority = 'NORMAL'
+  ): Promise<number> {
+    return this.enqueue(
+      async (conn) => await conn.getBalance(publicKey, commitment),
+      {
+        actionName: 'getBalance',
+        priority
+      }
+    );
+  }
+
+  public async getLatestBlockhash(
+    commitment?: any,
+    priority: RpcTaskPriority = 'HIGH'
+  ): Promise<any> {
+    return this.enqueue(
+      async (conn) => await conn.getLatestBlockhash(commitment),
+      {
+        actionName: 'getLatestBlockhash',
+        priority
+      }
+    );
+  }
+
   /**
    * Main scheduling worker loop.
    */
@@ -320,6 +367,7 @@ export class SolanaRpcQueue {
   }
 
   private recordRpcRequest(): void {
+    this.totalRequests++;
     this.requestTimestamps.push(Date.now());
   }
 
@@ -360,14 +408,15 @@ export class SolanaRpcQueue {
         task.retries++;
         this.totalRetries++;
 
-        // Global backpressure circuit breaker: engage immediately from the very first 429
-        const baseCircuitMs = 2500;
-        const exponentialFactor = Math.min(15000, baseCircuitMs * Math.pow(1.5, Math.min(this.consecutive429Count - 1, 4)));
-        const jitter = Math.floor(Math.random() * 400);
+        // Exponential backoff calculation using configured base and max
+        const baseDelay = this.backoffBaseMs * Math.pow(2, Math.min(this.consecutive429Count - 1, 5));
+        const exponentialFactor = Math.min(this.backoffMaxMs, Math.max(this.backoffBaseMs, baseDelay));
+        const jitter = Math.floor(Math.random() * 500);
 
         let retryAfterMs = 0;
-        if (err?.headers && typeof err.headers.get === 'function') {
-          const headerVal = err.headers.get('retry-after');
+        const headers = err?.headers || err?.response?.headers;
+        if (headers) {
+          const headerVal = typeof headers.get === 'function' ? headers.get('retry-after') : (headers['retry-after'] || headers['Retry-After']);
           if (headerVal) {
             const seconds = parseInt(headerVal, 10);
             if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
@@ -377,7 +426,8 @@ export class SolanaRpcQueue {
         const circuitDuration = Math.max(exponentialFactor + jitter, retryAfterMs);
         this.circuitBreakerUntil = Math.max(this.circuitBreakerUntil, Date.now() + circuitDuration);
 
-        console.warn(`[RPC_QUEUE] Global 429 backpressure active for ${Math.round(circuitDuration)}ms (consecutive=${this.consecutive429Count})`);
+        // Standardized 429 logging format
+        console.warn(`[RPC] status=429 queueDepth=${this.queuedTasks.length} retry=${task.retries} delayMs=${Math.round(circuitDuration)}`);
 
         if (this.circuitBreakerTimer) {
           clearTimeout(this.circuitBreakerTimer);
@@ -392,7 +442,6 @@ export class SolanaRpcQueue {
           task.lastError = errMsg;
 
           this.queuedTasks.push(task);
-          console.warn(`[RPC_QUEUE] signature=${task.signature || 'N/A'} action=${task.actionName} attempt=${task.retries}/${this.maxRetries} status=429_RETRY_WAIT retryInMs=${Math.round(task.nextAttemptAt - Date.now())}`);
           return;
         } else {
           console.error(`[RPC_QUEUE] signature=${task.signature || 'N/A'} action=${task.actionName} FAILED_PERMANENTLY after ${task.retries} retries due to 429 rate limit.`);
@@ -439,7 +488,17 @@ export class SolanaRpcQueue {
       oldestAge = now - Math.min(...this.queuedTasks.map(t => t.enqueuedAt));
     }
 
+    const circuitOpen = now < this.circuitBreakerUntil;
+
     return {
+      rpcRequests: this.totalRequests,
+      rpcSuccess: this.totalCompleted,
+      rpc429: this.total429Count,
+      rpcErrors: this.totalFailedPermanently,
+      rpcRetries: this.totalRetries,
+      rpcQueueDepth: this.queuedTasks.length,
+      rpcActiveRequests: this.activeWorkers,
+      rpcCircuitOpen: circuitOpen,
       queuedCount: this.queuedTasks.length,
       activeWorkers: this.activeWorkers,
       completedCount: this.totalCompleted,
@@ -448,7 +507,7 @@ export class SolanaRpcQueue {
       failedPermanentlyCount: this.totalFailedPermanently,
       avgFetchLatencyMs: avgLatency,
       oldestQueuedAgeMs: oldestAge,
-      circuitBreakerActive: now < this.circuitBreakerUntil,
+      circuitBreakerActive: circuitOpen,
       requestsLastSecond: this.requestTimestamps.length,
       completedLastMinute: this.completedTimestamps.length,
       failedLastMinute: this.failedTimestamps.length

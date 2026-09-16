@@ -11,6 +11,7 @@ import { PaperExecutionService } from './paperExecutionService';
 import { RealExecutionService } from './realExecutionService';
 import { jupiterService } from './jupiterService';
 import { SolanaRpcQueue } from './rpcQueue';
+import { TransactionClassifier } from './transactionClassifier';
 
 export type SignatureLifecycleStatus =
   | 'QUEUED'
@@ -336,89 +337,27 @@ export class SolanaTransactionQueue {
     trader: TraderWallet,
     signature: string
   ): Promise<void> {
-    if (!tx || !tx.meta) {
-      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=MISSING_METADATA trader=${trader.name}`);
-      return;
-    }
+    const classification = TransactionClassifier.classify(tx, trader.wallet_address);
 
-    // Explicitly handle failed on-chain transactions without treating them as token discovery errors
-    if (tx.meta.err !== null) {
+    if (classification.type === 'FAILED') {
       console.log(`[Monitor] ONCHAIN_TX_SKIPPED signature=${signature} reason=ONCHAIN_ERR trader=${trader.name}`);
       return;
     }
 
-    const accountKeys = tx.transaction.message.accountKeys.map(a => a.pubkey.toString());
-    const traderIndex = accountKeys.indexOf(trader.wallet_address);
-
-    if (traderIndex === -1) {
-      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=TRADER_NOT_IN_ACCOUNTS trader=${trader.name}`);
+    if (classification.type !== 'BUY' || !classification.mint) {
+      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=${classification.reason || 'NON_BUY'} trader=${trader.name}`);
+      if (classification.reason === 'BUY_MINT_AMBIGUOUS') {
+        console.log(`[BUY_REJECTED] reason=BUY_MINT_AMBIGUOUS signature=${signature}`);
+      }
       return;
     }
 
-    const preTokenBalances = tx.meta.preTokenBalances || [];
-    const postTokenBalances = tx.meta.postTokenBalances || [];
+    const targetMint = classification.mint;
+    const targetDecimals = classification.decimals ?? 9;
+    const tokenAcquiredAmount = classification.tokenAcquiredAmount ?? 0;
+    const solSpent = classification.solSpent ?? 0.0001;
 
-    let targetMint = '';
-    let targetDecimals = 0;
-    let tokenAcquiredAmount = 0;
-
-    const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-
-    // Inspect post token balances for trader acquisitions
-    for (const post of postTokenBalances) {
-      if (post.owner === trader.wallet_address) {
-        const candidateMint = post.mint;
-        if (isValidSolanaMint(candidateMint) && !isBaseAsset(candidateMint)) {
-          const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
-          const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
-          const postAmount = Number(post.uiTokenAmount.amount);
-
-          if (postAmount > preAmount) {
-            targetMint = candidateMint;
-            targetDecimals = post.uiTokenAmount.decimals;
-            tokenAcquiredAmount = (postAmount - preAmount) / Math.pow(10, targetDecimals);
-            break;
-          }
-        }
-      }
-    }
-
-    // Strict validation: If no non-base SPL token acquired, classify accurately (SELL, TRANSFER, BASE_ASSET)
-    if (!targetMint || !isValidSolanaMint(targetMint) || isBaseAsset(targetMint)) {
-      const isSell = postTokenBalances.some(post => {
-        if (post.owner === trader.wallet_address && !isBaseAsset(post.mint)) {
-          const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
-          const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
-          const postAmount = Number(post.uiTokenAmount.amount);
-          return postAmount < preAmount;
-        }
-        return false;
-      });
-
-      const isBaseTrade = postTokenBalances.some(post => post.owner === trader.wallet_address && isBaseAsset(post.mint));
-      const reason = isSell ? 'SELL_TRANSACTION' : (isBaseTrade ? 'BASE_ASSET_TRANSACTION' : 'TRANSFER_OR_OTHER');
-
-      console.log(`[TX_CLASSIFIER] NON_BUY_TRANSACTION signature=${signature} reason=${reason} trader=${trader.name}`);
-      return;
-    }
-
-    // Compute SOL / WSOL spent
-    const preSol = tx.meta.preBalances[traderIndex] || 0;
-    const postSol = tx.meta.postBalances[traderIndex] || 0;
-    let solSpentLamports = preSol - postSol;
-
-    const preWsol = preTokenBalances.find(p => p.owner === trader.wallet_address && p.mint === WSOL_MINT);
-    const postWsol = postTokenBalances.find(p => p.owner === trader.wallet_address && p.mint === WSOL_MINT);
-    if (preWsol && postWsol) {
-      const wsolDiff = Number(preWsol.uiTokenAmount.amount) - Number(postWsol.uiTokenAmount.amount);
-      if (wsolDiff > 0) {
-        solSpentLamports += wsolDiff;
-      }
-    }
-
-    const solSpent = Math.max(0.0001, solSpentLamports / 1e9);
-
-    console.log(`[BUY_DETECTED] trader=${trader.name} mint=${targetMint} signature=${signature} solSpent=${solSpent.toFixed(4)} tokenQty=${tokenAcquiredAmount}`);
+    console.log(`[BUY_DETECTED] trader=${trader.name} mint=${targetMint} signature=${signature} solSpent=${solSpent.toFixed(4)} tokenReceived=${tokenAcquiredAmount}`);
 
     // Update trader monitoring status
     const repo = TraderWalletRepository.getInstance(this.db);
@@ -653,7 +592,7 @@ export class SolanaTransactionQueue {
       if (realResult.success) {
         console.log(`[EXECUTION] mint=${mint} mode=REAL status=CONFIRMED sig=${realResult.signature}`);
       } else {
-        console.error(`[EXECUTION] mint=${mint} mode=REAL status=FAILED error=${realResult.error}`);
+        console.error(`[EXECUTION] mint=${mint} mode=REAL outcome=FAILED_EXECUTION error=${realResult.error}`);
       }
     }
   }
