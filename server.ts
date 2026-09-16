@@ -33,6 +33,9 @@ import { livePriceService, LivePrice } from './src/server/priceService.js';
 import { jupiterService } from './src/server/jupiterService.js';
 import { aiLearningEngine } from './src/server/aiLearningEngine.js';
 import { TokenDiscoveryService } from './src/server/tokenDiscoveryService.js';
+import { TraderWalletRepository } from './src/server/traderWalletRepository.js';
+import { RealExecutionService } from './src/server/realExecutionService.js';
+import { PipelineDiagnostics } from './src/types.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
 const appDir = typeof __dirname !== 'undefined'
@@ -46,7 +49,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json());
 
 // Helper to construct sanitized state without exposing sensitive secrets
-function getSanitizedState() {
+async function getSanitizedState() {
   const rawSettings = db.getSettings();
   const sanitizedSettings: Settings = {
     ...rawSettings
@@ -55,9 +58,29 @@ function getSanitizedState() {
 
   currentConnectionStatus.jupiter = jupiterService.getStatus();
 
+  const traderWallets = await TraderWalletRepository.getInstance(db).getTraderWallets();
+  const traderStatuses = TraderWalletRepository.getInstance(db).getMonitoringStatuses();
+
+  const pipeline: PipelineDiagnostics = {
+    traderMonitoring: solanaConnection ? 'CONNECTED' : 'DISCONNECTED',
+    traderBuyDetection: 'ACTIVE',
+    tokenDiscovery: 'ACTIVE',
+    dexScreener: 'CONNECTED',
+    rugCheck: rawSettings.enableRugCheck ? 'CONNECTED' : 'DISABLED',
+    momentumEngine: 'ACTIVE',
+    aiAuthorization: 'ACTIVE',
+    jupiter: jupiterService.getStatus(),
+    execution: rawSettings.trading_mode === 'PAPER' 
+      ? 'PAPER_ONLY' 
+      : (RealExecutionService.getInstance(db).isSignerConfigured() ? 'READY' : 'NOT_CONFIGURED')
+  };
+
+  currentConnectionStatus.pipeline = pipeline;
+  currentConnectionStatus.traderStatuses = traderStatuses;
+
   return {
     settings: sanitizedSettings,
-    traders: db.getTraderWallets(),
+    traders: traderWallets,
     observations: db.getTokenObservations(),
     discoveryFeed: TokenDiscoveryService.getInstance(db).getFeedState(),
     positions: db.getPositions(),
@@ -125,8 +148,8 @@ app.get('/api/jupiter/health', async (req, res) => {
 });
 
 // API: Get current state
-app.get('/api/state', (req, res) => {
-  res.json(getSanitizedState());
+app.get('/api/state', async (req, res) => {
+  res.json(await getSanitizedState());
 });
 
 // API: Check RebuyGuard status for a specific mint
@@ -217,29 +240,40 @@ app.post('/api/action', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid Solana Public Key address' });
       }
       try {
-        db.addTraderWallet({
+        const repo = TraderWalletRepository.getInstance(db);
+        const added = await repo.addTraderWallet({
           name: data.name,
           wallet_address: data.wallet_address,
           enabled: true
         });
-        setupLogsSubscription();
-        broadcastState();
-        res.json({ success: true });
+        await setupLogsSubscription();
+        await broadcastState();
+        res.json({ success: true, trader: added });
       } catch (err: any) {
         res.status(400).json({ success: false, error: err?.message || 'Failed to add trader' });
       }
     }
     else if (actionType === 'TOGGLE_TRADER') {
-      db.updateTraderWallet(data.id, { enabled: data.enabled });
-      setupLogsSubscription();
-      broadcastState();
-      res.json({ success: true });
+      try {
+        const repo = TraderWalletRepository.getInstance(db);
+        await repo.toggleTraderWallet(data.id, data.enabled);
+        await setupLogsSubscription();
+        await broadcastState();
+        res.json({ success: true });
+      } catch (err: any) {
+        res.status(400).json({ success: false, error: err?.message || 'Failed to toggle trader' });
+      }
     }
     else if (actionType === 'DELETE_TRADER') {
-      db.deleteTraderWallet(data.id);
-      setupLogsSubscription();
-      broadcastState();
-      res.json({ success: true });
+      try {
+        const repo = TraderWalletRepository.getInstance(db);
+        await repo.deleteTraderWallet(data.id);
+        await setupLogsSubscription();
+        await broadcastState();
+        res.json({ success: true });
+      } catch (err: any) {
+        res.status(400).json({ success: false, error: err?.message || 'Failed to delete trader' });
+      }
     }
     else if (actionType === 'UPDATE_SETTINGS') {
       const updatePayload = { ...data };
@@ -333,13 +367,17 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 // Broadcast state to all connected clients
-function broadcastState() {
-  const state = getSanitizedState();
-  const payload = JSON.stringify({ type: 'STATE_UPDATE', data: state });
-  for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
+async function broadcastState() {
+  try {
+    const state = await getSanitizedState();
+    const payload = JSON.stringify({ type: 'STATE_UPDATE', data: state });
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
     }
+  } catch (err) {
+    console.error('[broadcastState] Error building state update:', err);
   }
 }
 
@@ -441,20 +479,23 @@ async function initSolanaConnection() {
 }
 
 // Unsubscribe and subscribe to all enabled trader wallets' logs on Solana
-function setupLogsSubscription() {
+async function setupLogsSubscription() {
   if (!solanaConnection) return;
 
   // Clear existing subscriptions
   for (const subId of activeLogSubscriptions) {
     try {
-      solanaConnection.removeOnLogsListener(subId);
+      await solanaConnection.removeOnLogsListener(subId);
     } catch (err) {
       console.error('[Solana] Error removing log listener', err);
     }
   }
   activeLogSubscriptions = [];
 
-  const enabledTraders = db.getTraderWallets().filter(t => t.enabled);
+  const repo = TraderWalletRepository.getInstance(db);
+  const allTraders = await repo.getTraderWallets();
+  const enabledTraders = allTraders.filter(t => t.enabled);
+
   if (enabledTraders.length === 0) {
     console.log('[Solana] No enabled trader wallets to monitor.');
     return;
@@ -462,31 +503,59 @@ function setupLogsSubscription() {
 
   console.log(`[Solana] Setting up on-chain log subscriptions for ${enabledTraders.length} trader(s)...`);
 
-  enabledTraders.forEach(trader => {
+  for (const trader of enabledTraders) {
     if (!isValidSolanaMint(trader.wallet_address)) {
       console.warn(`[Solana] Skipping invalid trader wallet address: ${trader.wallet_address}`);
-      return;
+      repo.updateTraderMonitoringStatus(trader.id, {
+        traderName: trader.name,
+        walletAddress: trader.wallet_address,
+        subscriptionStatus: 'ERROR',
+        lastError: 'Invalid Solana Public Key address'
+      });
+      continue;
     }
 
     try {
       const pubkey = new PublicKey(trader.wallet_address);
-      const subId = solanaConnection!.onLogs(
+      const subId = solanaConnection.onLogs(
         pubkey,
         async (logs) => {
           if (!logs.signature || processedSignatures.has(logs.signature)) return;
           console.log(`[Solana] Real on-chain log event detected on wallet ${trader.name} (${trader.wallet_address}). Signature: ${logs.signature}`);
           
+          repo.updateTraderMonitoringStatus(trader.id, {
+            lastDetectedSignature: logs.signature,
+            lastProcessedTimestamp: new Date().toISOString(),
+            subscriptionStatus: 'MONITORING',
+            lastError: null
+          });
+
           // Process transaction in background
           processDetectedTransaction(logs.signature, trader);
         },
         'confirmed'
       );
+
       activeLogSubscriptions.push(subId);
-      console.log(`[Solana] Log listener active for trader: ${trader.name}`);
-    } catch (err) {
+      repo.updateTraderMonitoringStatus(trader.id, {
+        traderName: trader.name,
+        walletAddress: trader.wallet_address,
+        subscriptionId: subId,
+        subscriptionStatus: 'CONNECTED',
+        lastError: null
+      });
+
+      console.log(`[Solana] Log listener active (ID: ${subId}) for trader: ${trader.name}`);
+    } catch (err: any) {
       console.error(`[Solana] Failed to subscribe to logs for trader ${trader.name}:`, err);
+      repo.updateTraderMonitoringStatus(trader.id, {
+        traderName: trader.name,
+        walletAddress: trader.wallet_address,
+        subscriptionStatus: 'ERROR',
+        lastError: err?.message || 'Failed to establish log listener subscription'
+      });
     }
-  });
+  }
 }
 
 // Real Transaction Parsing & Token Discovery
@@ -799,11 +868,21 @@ async function evaluateAndCopyToken(
     rugcheck_passed: rugCheckPassed
   });
 
-  // If eligible, execute trade entry using our modular paper execution engine
+  // Track execution details for audit
+  let executionSnapshot: any = {
+    mode: settings.trading_mode,
+    mainnetEnabled: settings.mainnet_enabled,
+    status: isEligible ? 'EXECUTING' : 'REJECTED'
+  };
+
+  // If eligible, execute trade entry (PAPER vs REAL mainnet execution)
   if (isEligible) {
-    if (settings.trading_mode === 'PAPER') {
-      const priceSol = cachedSolUsdPrice > 0 ? price / cachedSolUsdPrice : 0.000001;
-      PaperExecutionService.getInstance(db).executeBuy(
+    const priceSol = cachedSolUsdPrice > 0 ? (typeof price === 'number' ? price / cachedSolUsdPrice : 0.000001) : 0.000001;
+    const isRealMode = settings.trading_mode === 'MAINNET' || settings.mainnet_enabled === true;
+
+    if (!isRealMode) {
+      console.log(`[PaperExecution] Executing PAPER trade for ${tokenSymbol} (${mint})...`);
+      const paperPos = PaperExecutionService.getInstance(db).executeBuy(
         mint,
         tokenName,
         tokenSymbol,
@@ -813,12 +892,55 @@ async function evaluateAndCopyToken(
         trader.name,
         buyDetails.signature
       );
+      executionSnapshot = {
+        mode: 'PAPER',
+        status: 'CONFIRMED',
+        details: 'PAPER TRADE',
+        positionId: paperPos.mint
+      };
     } else {
-      console.warn(`[Mainnet] Copy trading on MAINNET mode requested. Mainnet is currently a dry-run / paper system.`);
+      console.log(`[RealExecution] Executing REAL MAINNET trade for ${tokenSymbol} (${mint})...`);
+      const realResult = await RealExecutionService.getInstance(db).executeBuy(
+        mint,
+        tokenName,
+        tokenSymbol,
+        decimals,
+        priceSol,
+        trader.id,
+        trader.name,
+        buyDetails.signature,
+        solanaConnection
+      );
+
+      executionSnapshot = {
+        mode: 'MAINNET',
+        status: realResult.success ? 'CONFIRMED' : 'FAILED',
+        signature: realResult.signature,
+        error: realResult.error,
+        details: realResult.details
+      };
     }
   }
 
-  broadcastState();
+  // Record complete BuyAuthorizationAudit entry
+  db.addBuyAuthorizationAudit({
+    candidateId: mint,
+    tokenMint: mint,
+    tokenName: tokenName,
+    tokenSymbol: tokenSymbol,
+    traderWallet: trader.wallet_address,
+    sourceSignature: buyDetails.signature,
+    marketSnapshotJSON: JSON.stringify(candidate.market),
+    securitySnapshotJSON: JSON.stringify(candidate.security),
+    momentumSnapshotJSON: JSON.stringify(decision.momentum),
+    traderSnapshotJSON: JSON.stringify(candidate.trader),
+    executionSnapshotJSON: JSON.stringify(executionSnapshot),
+    decision: decision.decision,
+    rejectReasons: decision.rejectReasons,
+    strategyVersion: decision.strategyVersion
+  });
+
+  await broadcastState();
 }
 
 // Helper to resolve genuine token decimals from on-chain mint account
@@ -1240,28 +1362,31 @@ wss.on('connection', (ws) => {
           return;
         }
         try {
-          db.addTraderWallet({
+          const repo = TraderWalletRepository.getInstance(db);
+          await repo.addTraderWallet({
             name: data.name,
             wallet_address: data.wallet_address,
             enabled: true
           });
-          setupLogsSubscription();
-          broadcastState();
+          await setupLogsSubscription();
+          await broadcastState();
         } catch (err: any) {
           ws.send(JSON.stringify({ type: 'ERROR', message: err?.message || 'Failed to add trader' }));
         }
       }
 
       else if (actionType === 'TOGGLE_TRADER') {
-        db.updateTraderWallet(data.id, { enabled: data.enabled });
-        setupLogsSubscription();
-        broadcastState();
+        const repo = TraderWalletRepository.getInstance(db);
+        await repo.toggleTraderWallet(data.id, data.enabled);
+        await setupLogsSubscription();
+        await broadcastState();
       }
 
       else if (actionType === 'DELETE_TRADER') {
-        db.deleteTraderWallet(data.id);
-        setupLogsSubscription();
-        broadcastState();
+        const repo = TraderWalletRepository.getInstance(db);
+        await repo.deleteTraderWallet(data.id);
+        await setupLogsSubscription();
+        await broadcastState();
       }
 
       else if (actionType === 'UPDATE_SETTINGS') {
@@ -1356,6 +1481,10 @@ async function startServer() {
   // Start HTTP server on port 3000
   server.listen(PORT, '0.0.0.0', async () => {
     console.log(`[Server] Ultra Trading Bot listening on port ${PORT}`);
+    
+    // Initialize persistence repository (PostgreSQL or JSON fallback)
+    await TraderWalletRepository.getInstance(db).init();
+
     // Initial SOL price sync
     await updateSolUsdPrice();
     // Initialize blockchain connection on startup

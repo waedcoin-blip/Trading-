@@ -1,0 +1,304 @@
+import pg from 'pg';
+import { TraderWallet } from '../types';
+import { Database } from '../db';
+import { isValidSolanaMint } from '../utils/solana';
+
+export interface TraderMonitoringStatus {
+  traderId: string;
+  traderName: string;
+  walletAddress: string;
+  rpcEndpointName: string;
+  subscriptionId: number | null;
+  subscriptionStatus: 'CONNECTED' | 'MONITORING' | 'ERROR' | 'IDLE';
+  lastDetectedSignature: string | null;
+  lastProcessedTimestamp: string | null;
+  lastError: string | null;
+}
+
+export class TraderWalletRepository {
+  private static instance: TraderWalletRepository | null = null;
+  private pool: pg.Pool | null = null;
+  private dbFallback: Database;
+  private isPgAvailable = false;
+  private monitoringStatuses: Map<string, TraderMonitoringStatus> = new Map();
+
+  constructor(dbFallback: Database) {
+    this.dbFallback = dbFallback;
+    const dbUrl = process.env.DATABASE_URL;
+    if (dbUrl && dbUrl.trim() !== '') {
+      try {
+        this.pool = new pg.Pool({
+          connectionString: dbUrl.trim(),
+          ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+        });
+        this.isPgAvailable = true;
+      } catch (err) {
+        console.error('[TraderWalletRepository] Failed to initialize PostgreSQL pool, using JSON fallback:', err);
+        this.isPgAvailable = false;
+      }
+    }
+  }
+
+  public static getInstance(dbFallback: Database): TraderWalletRepository {
+    if (!TraderWalletRepository.instance) {
+      TraderWalletRepository.instance = new TraderWalletRepository(dbFallback);
+    }
+    return TraderWalletRepository.instance;
+  }
+
+  /**
+   * Initialize table structure and perform one-time migration from db.json if PG is empty.
+   */
+  public async init(): Promise<void> {
+    if (!this.isPgAvailable || !this.pool) {
+      console.log('[TraderWalletRepository] Operating in JSON fallback storage mode (DATABASE_URL not set).');
+      this.syncMonitoringStatusesFromMemory(this.dbFallback.getTraderWallets());
+      return;
+    }
+
+    try {
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS trader_wallets (
+          id VARCHAR(255) PRIMARY KEY,
+          user_id VARCHAR(255) NOT NULL DEFAULT 'default-user',
+          name VARCHAR(255) NOT NULL,
+          wallet_address VARCHAR(255) UNIQUE NOT NULL,
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      console.log('[TraderWalletRepository] PostgreSQL trader_wallets table initialized successfully.');
+
+      // Check if table is empty; if so, perform one-time migration from db.json
+      const countRes = await this.pool.query('SELECT COUNT(*) FROM trader_wallets');
+      const count = parseInt(countRes.rows[0].count, 10);
+
+      if (count === 0) {
+        const jsonWallets = this.dbFallback.getTraderWallets();
+        if (jsonWallets.length > 0) {
+          console.log(`[TraderWalletRepository] Migrating ${jsonWallets.length} trader wallet(s) from db.json to PostgreSQL...`);
+          for (const w of jsonWallets) {
+            const normalizedAddress = w.wallet_address.trim();
+            if (isValidSolanaMint(normalizedAddress)) {
+              await this.pool.query(
+                `INSERT INTO trader_wallets (id, user_id, name, wallet_address, enabled, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (wallet_address) DO NOTHING`,
+                [w.id, w.user_id || 'default-user', w.name, normalizedAddress, w.enabled, w.created_at || new Date().toISOString(), w.updated_at || new Date().toISOString()]
+              );
+            }
+          }
+          console.log('[TraderWalletRepository] Migration from db.json completed.');
+        }
+      }
+
+      const currentWallets = await this.getTraderWallets();
+      this.syncMonitoringStatusesFromMemory(currentWallets);
+    } catch (err) {
+      console.error('[TraderWalletRepository] Error initializing PostgreSQL table / migration:', err);
+      this.isPgAvailable = false;
+      this.syncMonitoringStatusesFromMemory(this.dbFallback.getTraderWallets());
+    }
+  }
+
+  public isPostgresActive(): boolean {
+    return this.isPgAvailable;
+  }
+
+  public async getTraderWallets(): Promise<TraderWallet[]> {
+    if (this.isPgAvailable && this.pool) {
+      try {
+        const res = await this.pool.query('SELECT * FROM trader_wallets ORDER BY created_at DESC');
+        return res.rows.map(row => ({
+          id: row.id,
+          user_id: row.user_id,
+          name: row.name,
+          wallet_address: row.wallet_address,
+          enabled: Boolean(row.enabled),
+          created_at: typeof row.created_at === 'object' ? row.created_at.toISOString() : String(row.created_at),
+          updated_at: typeof row.updated_at === 'object' ? row.updated_at.toISOString() : String(row.updated_at)
+        }));
+      } catch (err) {
+        console.error('[TraderWalletRepository] Error fetching wallets from PostgreSQL, falling back to JSON:', err);
+      }
+    }
+    return this.dbFallback.getTraderWallets();
+  }
+
+  public async addTraderWallet(data: { name: string; wallet_address: string; enabled?: boolean }): Promise<TraderWallet> {
+    const normalizedAddress = data.wallet_address.trim();
+
+    if (!isValidSolanaMint(normalizedAddress)) {
+      throw new Error('Invalid Solana Public Key wallet address.');
+    }
+
+    // Check duplicate address in database
+    const existingWallets = await this.getTraderWallets();
+    if (existingWallets.some(w => w.wallet_address.trim() === normalizedAddress)) {
+      throw new Error(`Trader wallet with address ${normalizedAddress} is already registered.`);
+    }
+
+    const now = new Date().toISOString();
+    const newId = 'wallet_' + Math.random().toString(36).substring(2, 11);
+
+    const newWallet: TraderWallet = {
+      id: newId,
+      user_id: 'default-user',
+      name: data.name.trim(),
+      wallet_address: normalizedAddress,
+      enabled: data.enabled !== undefined ? data.enabled : true,
+      created_at: now,
+      updated_at: now
+    };
+
+    if (this.isPgAvailable && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO trader_wallets (id, user_id, name, wallet_address, enabled, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [newWallet.id, newWallet.user_id, newWallet.name, newWallet.wallet_address, newWallet.enabled, newWallet.created_at, newWallet.updated_at]
+        );
+      } catch (err: any) {
+        console.error('[TraderWalletRepository] Failed to insert wallet into PostgreSQL:', err);
+        if (err?.code === '23505') {
+          throw new Error(`Trader wallet address ${normalizedAddress} already exists in database.`);
+        }
+        throw err;
+      }
+    }
+
+    // Always mirror in db.json for consistency & fallback
+    this.dbFallback.addTraderWallet({
+      id: newWallet.id,
+      name: newWallet.name,
+      wallet_address: newWallet.wallet_address,
+      enabled: newWallet.enabled
+    });
+
+    this.updateTraderMonitoringStatus(newWallet.id, {
+      traderId: newWallet.id,
+      traderName: newWallet.name,
+      walletAddress: newWallet.wallet_address,
+      rpcEndpointName: this.getSanitizedRpcEndpoint(),
+      subscriptionId: null,
+      subscriptionStatus: newWallet.enabled ? 'CONNECTED' : 'IDLE',
+      lastDetectedSignature: null,
+      lastProcessedTimestamp: null,
+      lastError: null
+    });
+
+    return newWallet;
+  }
+
+  public async toggleTraderWallet(id: string, enabled?: boolean): Promise<TraderWallet | null> {
+    const wallets = await this.getTraderWallets();
+    const existing = wallets.find(w => w.id === id);
+    if (!existing) return null;
+
+    const newEnabled = enabled !== undefined ? enabled : !existing.enabled;
+    const now = new Date().toISOString();
+
+    if (this.isPgAvailable && this.pool) {
+      try {
+        await this.pool.query(
+          `UPDATE trader_wallets SET enabled = $1, updated_at = $2 WHERE id = $3`,
+          [newEnabled, now, id]
+        );
+      } catch (err) {
+        console.error('[TraderWalletRepository] Failed to update wallet in PostgreSQL:', err);
+      }
+    }
+
+    this.dbFallback.updateTraderWallet(id, { enabled: newEnabled });
+
+    this.updateTraderMonitoringStatus(id, {
+      subscriptionStatus: newEnabled ? 'CONNECTED' : 'IDLE'
+    });
+
+    return {
+      ...existing,
+      enabled: newEnabled,
+      updated_at: now
+    };
+  }
+
+  public async deleteTraderWallet(id: string): Promise<boolean> {
+    let deleted = false;
+    if (this.isPgAvailable && this.pool) {
+      try {
+        const res = await this.pool.query('DELETE FROM trader_wallets WHERE id = $1', [id]);
+        deleted = (res.rowCount ?? 0) > 0;
+      } catch (err) {
+        console.error('[TraderWalletRepository] Failed to delete wallet from PostgreSQL:', err);
+      }
+    }
+
+    const jsonDeleted = this.dbFallback.deleteTraderWallet(id);
+    this.monitoringStatuses.delete(id);
+
+    return deleted || jsonDeleted;
+  }
+
+  // --- Monitoring Health Status Tracker ---
+  public updateTraderMonitoringStatus(traderId: string, statusPartial: Partial<TraderMonitoringStatus>): void {
+    const existing = this.monitoringStatuses.get(traderId) || {
+      traderId,
+      traderName: '',
+      walletAddress: '',
+      rpcEndpointName: this.getSanitizedRpcEndpoint(),
+      subscriptionId: null,
+      subscriptionStatus: 'IDLE',
+      lastDetectedSignature: null,
+      lastProcessedTimestamp: null,
+      lastError: null
+    };
+
+    this.monitoringStatuses.set(traderId, {
+      ...existing,
+      ...statusPartial,
+      rpcEndpointName: this.getSanitizedRpcEndpoint()
+    });
+  }
+
+  public getMonitoringStatuses(): Record<string, TraderMonitoringStatus> {
+    const result: Record<string, TraderMonitoringStatus> = {};
+    for (const [id, status] of this.monitoringStatuses.entries()) {
+      result[id] = { ...status };
+    }
+    return result;
+  }
+
+  private syncMonitoringStatusesFromMemory(wallets: TraderWallet[]): void {
+    const rpcName = this.getSanitizedRpcEndpoint();
+    for (const w of wallets) {
+      if (!this.monitoringStatuses.has(w.id)) {
+        this.monitoringStatuses.set(w.id, {
+          traderId: w.id,
+          traderName: w.name,
+          walletAddress: w.wallet_address,
+          rpcEndpointName: rpcName,
+          subscriptionId: null,
+          subscriptionStatus: w.enabled ? 'CONNECTED' : 'IDLE',
+          lastDetectedSignature: null,
+          lastProcessedTimestamp: null,
+          lastError: null
+        });
+      }
+    }
+  }
+
+  /**
+   * Returns a sanitized RPC endpoint hostname (omitting API keys/secrets)
+   */
+  public getSanitizedRpcEndpoint(): string {
+    const rpcUrl = process.env.RPC_URL || process.env.SOLANA_RPC_URL || this.dbFallback.getSettings().rpc_url || 'https://api.mainnet-beta.solana.com';
+    try {
+      const parsed = new URL(rpcUrl);
+      return parsed.hostname;
+    } catch {
+      return 'solana-rpc';
+    }
+  }
+}

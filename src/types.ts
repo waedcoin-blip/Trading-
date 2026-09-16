@@ -159,10 +159,10 @@ export interface Position extends ActivePosition {
   entry_price: number; // in SOL per token
   entryPrice: string;
   sol_in: number; // SOL invested
-  raw_sol_in: string; // lamports (as string for safety)
+  raw_sol_in?: string; // lamports (as string for safety)
   investedAmount: string;
   token_amount: number; // Decimals-adjusted
-  raw_token_amount: string; // raw token units
+  raw_token_amount?: string; // raw token units
   token_decimals: number;
   buy_time: string;
   current_price: number; // in SOL per token
@@ -177,8 +177,8 @@ export interface Position extends ActivePosition {
   status: 'ACTIVE' | 'SOLD' | 'ERROR';
   data_error?: boolean;
   data_error_message?: string;
-  take_profit_percent: number;
-  stop_loss_percent: number;
+  take_profit_percent?: number;
+  stop_loss_percent?: number;
   rugcheck?: RugCheckResult;
   created_at: string;
   updated_at: string;
@@ -250,11 +250,39 @@ export interface AIStats {
   riskConditions: string[];
 }
 
+export interface TraderMonitoringStatus {
+  traderId: string;
+  traderName: string;
+  walletAddress: string;
+  rpcEndpointName: string;
+  subscriptionId: number | null;
+  subscriptionStatus: 'CONNECTED' | 'MONITORING' | 'ERROR' | 'IDLE';
+  lastDetectedSignature: string | null;
+  lastProcessedTimestamp: string | null;
+  lastError: string | null;
+}
+
+export interface PipelineDiagnostics {
+  traderMonitoring: 'CONNECTED' | 'DISCONNECTED' | 'ERROR' | 'IDLE';
+  traderBuyDetection: 'ACTIVE' | 'INACTIVE';
+  tokenDiscovery: 'ACTIVE' | 'INACTIVE';
+  dexScreener: 'CONNECTED' | 'ERROR';
+  rugCheck: 'CONNECTED' | 'DISABLED' | 'ERROR';
+  momentumEngine: 'ACTIVE' | 'INACTIVE';
+  aiAuthorization: 'ACTIVE' | 'INACTIVE';
+  jupiter: JupiterStatus;
+  execution: 'READY' | 'PAPER_ONLY' | 'NOT_CONFIGURED';
+}
+
+export type JupiterStatus = 'CONNECTED' | 'INVALID_API_KEY' | 'RATE_LIMITED' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED';
+
 export interface ConnectionStatus {
   rpc: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
   wss: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
   laserstream: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
-  jupiter: 'CONNECTED' | 'INVALID_API_KEY' | 'RATE_LIMITED' | 'CONNECTION_ERROR' | 'NOT_CONFIGURED';
+  jupiter: JupiterStatus;
+  pipeline?: PipelineDiagnostics;
+  traderStatuses?: Record<string, TraderMonitoringStatus>;
 }
 
 export interface TradeAuditRecord {

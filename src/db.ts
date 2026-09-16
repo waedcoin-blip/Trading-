@@ -341,7 +341,7 @@ export class Database {
     return [...this.read().trader_wallets];
   }
 
-  public addTraderWallet(wallet: Omit<TraderWallet, 'id' | 'user_id' | 'created_at' | 'updated_at'>): TraderWallet {
+  public addTraderWallet(wallet: Partial<TraderWallet> & { name: string; wallet_address: string; enabled?: boolean }): TraderWallet {
     if (!isValidSolanaMint(wallet.wallet_address)) {
       throw new Error('Invalid Solana Public Key wallet address.');
     }
@@ -350,10 +350,11 @@ export class Database {
     const now = new Date().toISOString();
     const newWallet: TraderWallet = {
       ...wallet,
-      id: 'wallet_' + Math.random().toString(36).substring(2, 11),
-      user_id: 'default-user',
-      created_at: now,
-      updated_at: now
+      id: wallet.id || ('wallet_' + Math.random().toString(36).substring(2, 11)),
+      user_id: wallet.user_id || 'default-user',
+      enabled: wallet.enabled !== undefined ? wallet.enabled : true,
+      created_at: wallet.created_at || now,
+      updated_at: wallet.updated_at || now
     };
 
     current.trader_wallets.push(newWallet);
@@ -521,23 +522,60 @@ export class Database {
     return [...this.read().positions];
   }
 
-  public addPosition(pos: Omit<Position, 'id' | 'user_id' | 'created_at' | 'updated_at'>): Position {
-    const mint = pos.token_mint || pos.mint;
+  public addPosition(pos: Partial<Position> & { token_mint: string }): Position {
+    const mint = pos.token_mint || pos.mint || '';
     if (!isValidSolanaMint(mint)) {
       throw new Error('Invalid token mint for position.');
     }
 
     const current = this.read();
     const now = new Date().toISOString();
+    const solIn = pos.sol_in || 0;
+    const tokenAmount = pos.token_amount || 0;
+    const decimals = pos.token_decimals || pos.tokenDecimals || 9;
+    const entryPrice = pos.entry_price || (tokenAmount > 0 ? solIn / tokenAmount : 0);
+    const currentPrice = pos.current_price || entryPrice;
+    const currentValueSol = pos.current_value_sol || (tokenAmount * currentPrice);
+    const pnlSol = pos.unrealized_pnl_sol || (currentValueSol - solIn);
+    const pnlPercent = pos.unrealized_pnl_percent || (solIn > 0 ? (pnlSol / solIn) * 100 : 0);
+    const qtyStr = pos.tokenQuantity || formatTokenQuantity(tokenAmount, decimals);
+
     const newPos: Position = {
-      ...pos,
       id: 'pos_' + Math.random().toString(36).substring(2, 11),
-      user_id: 'default-user',
+      user_id: pos.user_id || 'default-user',
       token_mint: mint,
       mint: mint,
+      token_name: pos.token_name || 'Token',
+      token_symbol: pos.token_symbol || 'TKN',
+      symbol: pos.token_symbol || pos.symbol || 'TKN',
+      source_trader_id: pos.source_trader_id || '',
+      source_trader_name: pos.source_trader_name || '',
+      buy_signature: pos.buy_signature || pos.buySignature || '',
+      buySignature: pos.buySignature || pos.buy_signature || '',
+      tokenQuantity: qtyStr,
+      remainingTokenQuantity: qtyStr,
+      remainingQuantity: qtyStr,
+      tokenDecimals: decimals,
+      token_decimals: decimals,
+      entry_price: entryPrice,
+      entryPrice: `${entryPrice.toFixed(10)} SOL`,
+      investedAmount: `${solIn.toFixed(4)} SOL`,
+      sol_in: solIn,
+      token_amount: tokenAmount,
+      current_price: currentPrice,
+      currentPrice: `${currentPrice.toFixed(10)} SOL`,
+      current_value_sol: currentValueSol,
+      currentValue: `${currentValueSol.toFixed(4)} SOL`,
+      unrealized_pnl_sol: pnlSol,
+      unrealizedPnl: `${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
+      unrealized_pnl_percent: pnlPercent,
+      unrealizedPnlPercent: `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`,
       network: 'mainnet-beta',
+      buy_time: pos.buy_time || now,
+      status: pos.status || 'ACTIVE',
       created_at: now,
-      updated_at: now
+      updated_at: now,
+      ...pos
     };
 
     current.positions.unshift(newPos);

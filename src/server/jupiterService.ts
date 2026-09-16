@@ -293,6 +293,90 @@ class JupiterService {
     }
   }
 
+  /**
+   * Fetches an authoritative Jupiter V6 Swap Quote for real trade execution.
+   */
+  public async getQuote(
+    inputMint: string,
+    outputMint: string,
+    amountLamports: number,
+    slippageBps: number = 100
+  ): Promise<any> {
+    const apiKey = this.getApiKey();
+    const headers: Record<string, string> = {
+      'Accept': 'application/json'
+    };
+    if (apiKey) {
+      headers['x-api-key'] = apiKey;
+    }
+
+    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+
+    try {
+      const response = await fetch(url, { method: 'GET', headers });
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`JUPITER_QUOTE_FAILED: HTTP ${response.status} - ${errText.slice(0, 150)}`);
+      }
+
+      const quoteData = await response.json();
+      if (!quoteData || !quoteData.outAmount) {
+        throw new Error('JUPITER_QUOTE_FAILED: Invalid quote response returned by Jupiter API');
+      }
+
+      return quoteData;
+    } catch (err: any) {
+      console.error('[JupiterService] Quote request failed:', err?.message || err);
+      throw err;
+    }
+  }
+
+  /**
+   * Builds an unsigned VersionedTransaction from a Jupiter V6 quote response.
+   */
+  public async buildSwapTransaction(quoteResponse: any, userPublicKey: string): Promise<string> {
+    const apiKey = this.getApiKey();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    };
+    if (apiKey) {
+      headers['x-api-key'] = apiKey;
+    }
+
+    const url = 'https://quote-api.jup.ag/v6/swap';
+    const body = {
+      quoteResponse,
+      userPublicKey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: 'auto'
+    };
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`JUPITER_SWAP_BUILD_FAILED: HTTP ${response.status} - ${errText.slice(0, 150)}`);
+      }
+
+      const data = await response.json();
+      if (!data || !data.swapTransaction) {
+        throw new Error('JUPITER_SWAP_BUILD_FAILED: Missing swapTransaction base64 in response');
+      }
+
+      return data.swapTransaction;
+    } catch (err: any) {
+      console.error('[JupiterService] Swap build failed:', err?.message || err);
+      throw err;
+    }
+  }
+
   public getStatus(): JupiterStatus {
     const apiKey = this.getApiKey();
     if (!apiKey) return 'NOT_CONFIGURED';
