@@ -135,6 +135,16 @@ export default function App() {
               };
             });
           }
+        } else if (payload.type === 'TOKEN_DISCOVERY_REFRESHED') {
+          const discoveryData = payload.data;
+          setState(prevState => {
+            if (!prevState) return prevState;
+            return {
+              ...prevState,
+              observations: discoveryData.tokens || [],
+              discoveryFeed: discoveryData
+            };
+          });
         } else if (payload.type === 'POSITION_PNL_UPDATE') {
           const { positionId, mint, pnlSol, pnlPercent, currentValueSol, currentPriceSol, currentPriceUsd, solUsdRate, priceUpdatedAt, priceSource, isStale } = payload.data;
           

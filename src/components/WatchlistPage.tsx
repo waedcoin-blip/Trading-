@@ -21,13 +21,53 @@ interface WatchlistPageProps {
 }
 
 export default function WatchlistPage({ state, sendAction }: WatchlistPageProps) {
-  const { traders, observations } = state;
+  const { traders, observations, discoveryFeed } = state;
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [error, setError] = useState('');
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState<number>(120);
 
   // Filter observations to guarantee only genuine Solana mints are ever rendered
   const validObservations = observations.filter(obs => isValidSolanaMint(obs.token_mint));
+
+  // Ticking countdown timer for 2-minute rolling discovery refresh
+  React.useEffect(() => {
+    const targetTime = discoveryFeed?.nextRefreshAt || (Date.now() + 120000);
+    
+    const updateTimer = () => {
+      const remaining = Math.max(0, Math.ceil((targetTime - Date.now()) / 1000));
+      setSecondsLeft(remaining);
+    };
+
+    updateTimer();
+    const timer = setInterval(updateTimer, 1000);
+    return () => clearInterval(timer);
+  }, [discoveryFeed?.nextRefreshAt, discoveryFeed?.timestamp]);
+
+  const formatCountdown = (totalSec: number) => {
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const formatTime = (ts?: number | string) => {
+    if (!ts) return 'Just now';
+    const date = typeof ts === 'number' ? new Date(ts) : new Date(ts);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  const handleManualRefresh = async () => {
+    if (isManualRefreshing) return;
+    setIsManualRefreshing(true);
+    try {
+      await fetch('/api/discovery/refresh', { method: 'POST' });
+    } catch (err) {
+      console.error('Manual refresh failed:', err);
+    } finally {
+      setIsManualRefreshing(false);
+    }
+  };
 
   const handleAddTrader = (e: React.FormEvent) => {
     e.preventDefault();
@@ -192,19 +232,70 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
 
       {/* Eligible Token Discovery Feed */}
       <div className="bg-[#12161f] border border-[#1e2533] rounded-lg p-5" id="discovery_feed_panel">
-        <div className="flex items-center justify-between mb-4 border-b border-[#1e2533] pb-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 border-b border-[#1e2533] pb-3">
           <div className="flex items-center gap-2">
-            <Zap className="text-[#f59e0b] w-5 h-5" />
-            <h2 className="text-md font-semibold text-[#f3f4f6]">Real-Time Token Discovery & Filter Feed</h2>
+            <Zap className="text-[#f59e0b] w-5 h-5 shrink-0" />
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-md font-semibold text-[#f3f4f6]">Real-Time Token Discovery & Filter Feed</h2>
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  LIVE (2m Rolling)
+                </span>
+              </div>
+              <p className="text-[11px] text-[#6b7280]">Authoritative 120-second discovery feed — automatically purges & replaces every 2 minutes</p>
+            </div>
           </div>
-          <span className="text-xs text-[#6b7280]">Showing genuine on-chain observations ({validObservations.length})</span>
+
+          <div className="flex items-center gap-3 self-end sm:self-auto">
+            {/* Status & Timer details */}
+            <div className="text-right text-[11px] font-mono">
+              <div className="text-[#9ca3af]">
+                Last updated: <span className="text-[#f3f4f6] font-semibold">{formatTime(discoveryFeed?.timestamp)}</span>
+              </div>
+              <div className="text-[#6b7280]">
+                Next refresh: <span className="text-amber-400 font-bold">{formatCountdown(secondsLeft)}</span>
+              </div>
+            </div>
+
+            {/* Manual Trigger Button */}
+            <button
+              onClick={handleManualRefresh}
+              disabled={isManualRefreshing || discoveryFeed?.status === 'REFRESHING'}
+              className="p-2 bg-[#1e2533] hover:bg-[#2a3447] text-[#d1d5db] hover:text-white rounded text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
+              title="Force immediate 2-minute discovery refresh"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isManualRefreshing || discoveryFeed?.status === 'REFRESHING' ? 'animate-spin text-amber-400' : ''}`} />
+              <span className="hidden md:inline">Refresh</span>
+            </button>
+          </div>
         </div>
+
+        {/* Refreshing Status Banner */}
+        {discoveryFeed?.status === 'REFRESHING' && (
+          <div className="mb-4 bg-amber-500/10 border border-amber-500/20 rounded-md p-2.5 text-xs text-amber-300 flex items-center justify-between animate-pulse">
+            <div className="flex items-center gap-2">
+              <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
+              <span>Scanning Solana cluster & DexScreener DEX streams... Purging old feed and evaluating fresh candidates.</span>
+            </div>
+          </div>
+        )}
+
+        {/* Error Status Banner */}
+        {discoveryFeed?.status === 'FAILED' && discoveryFeed.error && (
+          <div className="mb-4 bg-red-500/10 border border-red-500/20 rounded-md p-2.5 text-xs text-red-400 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>Discovery refresh warning: {discoveryFeed.error}. Retrying on next 120s cycle.</span>
+            </div>
+          </div>
+        )}
 
         {validObservations.length === 0 ? (
           <div className="py-12 flex flex-col items-center justify-center text-center text-xs text-[#6b7280]">
             <RefreshCw className="w-8 h-8 mb-2 opacity-20 animate-spin" />
-            <p>Listening to Solana cluster for trader buy transactions...</p>
-            <p className="text-[10px] text-[#4b5563] mt-1">When an enabled trader executes a buy transaction on Solana DEXes, real mint detection and DexScreener filters execute automatically.</p>
+            <p className="font-medium text-[#d1d5db]">No tokens currently discovered in this 2-minute window.</p>
+            <p className="text-[10px] text-[#4b5563] mt-1">Discovery feed updates every 120 seconds. Next automated scan in {formatCountdown(secondsLeft)}.</p>
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4" id="observations_grid">

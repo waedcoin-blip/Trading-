@@ -32,6 +32,7 @@ import {
 import { livePriceService, LivePrice } from './src/server/priceService.js';
 import { jupiterService } from './src/server/jupiterService.js';
 import { aiLearningEngine } from './src/server/aiLearningEngine.js';
+import { TokenDiscoveryService } from './src/server/tokenDiscoveryService.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
 const appDir = typeof __dirname !== 'undefined'
@@ -58,6 +59,7 @@ function getSanitizedState() {
     settings: sanitizedSettings,
     traders: db.getTraderWallets(),
     observations: db.getTokenObservations(),
+    discoveryFeed: TokenDiscoveryService.getInstance(db).getFeedState(),
     positions: db.getPositions(),
     trades: db.getTrades(),
     connection: currentConnectionStatus,
@@ -67,6 +69,32 @@ function getSanitizedState() {
     buy_authorization_audits: db.getBuyAuthorizationAudits()
   };
 }
+
+// API: Real-Time Token Discovery & Filter Feed API (Requirement 9)
+app.get(['/api/discovery/feed', '/api/discovery'], (req, res) => {
+  const feedState = TokenDiscoveryService.getInstance(db).getFeedState();
+  res.json({
+    success: feedState.status !== 'FAILED',
+    timestamp: feedState.timestamp,
+    nextRefreshAt: feedState.nextRefreshAt,
+    status: feedState.status,
+    error: feedState.error,
+    tokens: feedState.tokens || []
+  });
+});
+
+app.post('/api/discovery/refresh', async (req, res) => {
+  await TokenDiscoveryService.getInstance(db).runRefreshCycle();
+  const feedState = TokenDiscoveryService.getInstance(db).getFeedState();
+  res.json({
+    success: feedState.status !== 'FAILED',
+    timestamp: feedState.timestamp,
+    nextRefreshAt: feedState.nextRefreshAt,
+    status: feedState.status,
+    error: feedState.error,
+    tokens: feedState.tokens || []
+  });
+});
 
 // API: Health endpoint for Render & local health checks
 app.get(['/health', '/api/health'], (req, res) => {
@@ -1332,6 +1360,21 @@ async function startServer() {
     await updateSolUsdPrice();
     // Initialize blockchain connection on startup
     await initSolanaConnection();
+
+    // Initialize & start authoritative 120s Token Discovery Service (Requirement 1, 10, 14)
+    TokenDiscoveryService.getInstance(db).start((feedState) => {
+      // Broadcast WebSocket TOKEN_DISCOVERY_REFRESHED event to all clients
+      const discoveryPayload = JSON.stringify({
+        type: 'TOKEN_DISCOVERY_REFRESHED',
+        data: feedState
+      });
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(discoveryPayload);
+        }
+      }
+      broadcastState();
+    });
   });
 }
 

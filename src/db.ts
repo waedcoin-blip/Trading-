@@ -421,6 +421,21 @@ export class Database {
     return [...this.read().token_observations];
   }
 
+  public clearTokenObservations(): void {
+    const current = this.read();
+    current.token_observations = [];
+    this.save();
+  }
+
+  public setTokenObservations(tokens: TokenObservation[]): TokenObservation[] {
+    const current = this.read();
+    // Validate each observation mint and sanitize
+    const sanitized = tokens.filter(t => t && isValidSolanaMint(t.token_mint));
+    current.token_observations = sanitized;
+    this.save();
+    return [...current.token_observations];
+  }
+
   public addTokenObservation(obs: Omit<TokenObservation, 'id' | 'timestamp'>): TokenObservation {
     if (!isValidSolanaMint(obs.token_mint)) {
       throw new Error('Invalid token mint for observation.');

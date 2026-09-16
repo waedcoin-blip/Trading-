@@ -99,6 +99,8 @@ export interface TokenObservation {
   buyers_10s: number | 'UNKNOWN';
   price: number | 'UNKNOWN';
   timestamp: string;
+  discoveredAt?: string;
+  expiresAt?: string;
   status: 'ELIGIBLE' | 'REJECT' | 'WAIT';
   rejection_reason?: string;
   source_trader_name?: string;
@@ -440,10 +442,19 @@ export interface AILearningState {
   lastUpdated: string;
 }
 
+export interface DiscoveryFeedState {
+  timestamp: number;
+  nextRefreshAt: number;
+  status: 'IDLE' | 'REFRESHING' | 'SUCCESS' | 'FAILED';
+  error?: string | null;
+  tokens?: TokenObservation[];
+}
+
 export interface ServerState {
   settings: Settings;
   traders: TraderWallet[];
   observations: TokenObservation[];
+  discoveryFeed?: DiscoveryFeedState;
   positions: Position[];
   trades: Trade[];
   connection: ConnectionStatus;
