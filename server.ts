@@ -176,7 +176,7 @@ app.get(['/health', '/api/health'], (req, res) => {
   });
 });
 
-// --- API: User Auth & Cloud SQL Synchronization ---
+// --- API: User Auth & Firebase Firestore Profile Synchronization ---
 app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res) => {
   try {
     if (!req.user || !req.user.uid) {
@@ -1530,7 +1530,7 @@ async function startServer() {
   server.listen(PORT, '0.0.0.0', async () => {
     console.log(`[Server] Ultra Trading Bot listening on port ${PORT}`);
     
-    // Initialize persistence repository (PostgreSQL or JSON fallback)
+    // Initialize persistence repository (Firebase Firestore or local fallback)
     await TraderWalletRepository.getInstance(db).init();
 
     // Initial SOL price sync
