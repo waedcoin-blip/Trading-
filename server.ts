@@ -1532,6 +1532,7 @@ async function startServer() {
     
     // Initialize persistence repository (Firebase Firestore or local fallback)
     await TraderWalletRepository.getInstance(db).init();
+    await PaperExecutionService.getInstance(db).syncStateFromFirestore();
 
     // Initial SOL price sync
     await updateSolUsdPrice();

@@ -477,4 +477,68 @@ export class PaperExecutionService {
     });
     return result.success ? result.position || null : null;
   }
+
+  /**
+   * Syncs paper trading state (balance, positions, trades) from Firestore at server startup.
+   */
+  public async syncStateFromFirestore(userId: string = this.userId): Promise<void> {
+    if (!this.isFirestoreConnected()) return;
+
+    try {
+      const userRef = adminFirestore.collection('users').doc(userId);
+
+      // 1. Sync Portfolio Balance
+      const portfolioDoc = await userRef.collection('paper_portfolios').doc('default').get();
+      if (portfolioDoc.exists) {
+        const paperBalanceSol = portfolioDoc.data()?.paperBalanceSol;
+        if (typeof paperBalanceSol === 'number' && Number.isFinite(paperBalanceSol)) {
+          this.db.updateSettings({ paper_balance_sol: paperBalanceSol });
+        }
+      }
+
+      // 2. Sync Active Positions
+      const positionsSnap = await userRef.collection('paper_positions').where('status', '==', 'ACTIVE').get();
+      if (!positionsSnap.empty) {
+        const loadedPositions: Position[] = [];
+        positionsSnap.forEach(doc => {
+          const data = doc.data() as Position;
+          loadedPositions.push({
+            ...data,
+            id: doc.id
+          });
+        });
+
+        const existingPositions = this.db.getPositions();
+        for (const loadedPos of loadedPositions) {
+          if (!existingPositions.some(p => p.id === loadedPos.id || p.buy_signature === loadedPos.buy_signature)) {
+            this.db.addPosition(loadedPos);
+          }
+        }
+      }
+
+      // 3. Sync Completed Trades History
+      const tradesSnap = await userRef.collection('paper_trades').get();
+      if (!tradesSnap.empty) {
+        const loadedTrades: Trade[] = [];
+        tradesSnap.forEach(doc => {
+          const data = doc.data() as Trade;
+          loadedTrades.push({
+            ...data,
+            id: doc.id
+          });
+        });
+
+        const existingTrades = this.db.getTrades();
+        for (const loadedTrade of loadedTrades) {
+          if (!existingTrades.some(t => t.id === loadedTrade.id || t.sell_signature === loadedTrade.sell_signature)) {
+            this.db.addTrade(loadedTrade);
+          }
+        }
+      }
+
+      console.log(`[PaperExecution] Synced paper trading state from Firestore for user ${userId}. Paper balance: ${this.db.getSettings().paper_balance_sol} SOL`);
+    } catch (err: any) {
+      console.error('[PaperExecution] Error syncing paper state from Firestore:', err?.message || err);
+    }
+  }
 }

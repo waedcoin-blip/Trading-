@@ -63,8 +63,8 @@ Database:
 Database:
   Provider: Firebase Firestore
   Configured: YES
-  Connection: OK
-  Trader wallet persistence: READY
+  Connection: READY
+  Trader wallet persistence: ENABLED
       `.trim());
 
       const currentWallets = await this.getAllTraderWalletsGlobally();
