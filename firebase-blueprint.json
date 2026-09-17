@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User profile data associated with a Firebase Authentication UID",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Firebase Auth UID matching document ID"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User primary email address"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name"
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Avatar image URL"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of profile creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update"
+        }
+      },
+      "required": ["id", "email"]
+    },
+    "TraderWallet": {
+      "title": "Trader Wallet",
+      "description": "Solana trader wallet address monitored for copy trading",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique wallet tracking identifier"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase UID"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable label for the wallet"
+        },
+        "walletAddress": {
+          "type": "string",
+          "description": "Valid base58 Solana public key"
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether real-time monitoring is active"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO update timestamp"
+        }
+      },
+      "required": ["id", "userId", "name", "walletAddress", "enabled"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Individual user document containing account information"
+    },
+    "/users/{userId}/trader_wallets/{walletId}": {
+      "schema": "TraderWallet",
+      "description": "Subcollection of trader wallets configured by this user"
+    }
+  }
+}

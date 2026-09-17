@@ -13,6 +13,7 @@ import { getRugCheckReport, validateRugCheck } from './src/server/rugcheck.js';
 import { BuyAuthorizationService } from './src/server/buyAuthorization.js';
 import { MomentumService } from './src/server/momentumService.js';
 import { PaperExecutionService } from './src/server/paperExecutionService.js';
+import { ExecutionGateway } from './src/server/executionGateway.js';
 import { UnifiedExitService } from './src/server/unifiedExitService.js';
 import { 
   isValidSolanaMint, 
@@ -34,10 +35,12 @@ import { jupiterService } from './src/server/jupiterService.js';
 import { aiLearningEngine } from './src/server/aiLearningEngine.js';
 import { TokenDiscoveryService } from './src/server/tokenDiscoveryService.js';
 import { TraderWalletRepository } from './src/server/traderWalletRepository.js';
+import { adminFirestore } from './src/lib/firebase-admin.js';
 import { RealExecutionService } from './src/server/realExecutionService.js';
 import { SolanaTransactionQueue } from './src/server/transactionQueue.js';
 import { SolanaRpcQueue } from './src/server/rpcQueue.js';
 import { PipelineDiagnostics } from './src/types.js';
+import { requireAuth, AuthRequest } from './src/middleware/auth.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
 const appDir = typeof __dirname !== 'undefined' ? __dirname : process.cwd();
@@ -57,10 +60,7 @@ async function getSanitizedState() {
   delete (sanitizedSettings as any).jupiter_api_key;
 
   currentConnectionStatus.jupiter = jupiterService.getStatus();
-  currentConnectionStatus.databaseMode = TraderWalletRepository.getInstance(db).getStorageMode();
-
-  const traderWallets = await TraderWalletRepository.getInstance(db).getTraderWallets();
-  const traderStatuses = TraderWalletRepository.getInstance(db).getMonitoringStatuses();
+  currentConnectionStatus.databaseMode = 'FIRESTORE';
 
   const pipeline: PipelineDiagnostics = {
     traderMonitoring: solanaConnection ? 'CONNECTED' : 'DISCONNECTED',
@@ -77,12 +77,12 @@ async function getSanitizedState() {
   };
 
   currentConnectionStatus.pipeline = pipeline;
-  currentConnectionStatus.traderStatuses = traderStatuses;
+  currentConnectionStatus.traderStatuses = {};
   currentConnectionStatus.queueMetrics = SolanaTransactionQueue.getInstance(db, () => solanaConnection).getMetrics();
 
   return {
     settings: sanitizedSettings,
-    traders: traderWallets,
+    traders: [], // Handled securely via REST API
     observations: db.getTokenObservations(),
     discoveryFeed: TokenDiscoveryService.getInstance(db).getFeedState(),
     positions: db.getPositions(),
@@ -139,9 +139,13 @@ app.get(['/health', '/api/health'], (req, res) => {
     service: 'trading-server',
     uptimeSec: Math.floor(process.uptime()),
     database: {
-      mode: repo.getStorageMode(),
+      provider: 'Firestore',
+      configured: true,
+      connected: repo.getDbStatus() === 'connected',
+      mode: 'FIRESTORE',
       status: repo.getDbStatus(),
-      traderWalletCount: repo.getTraderWalletCount()
+      traderWalletCount: repo.getTraderWalletCount(),
+      sanitizedUrl: 'firestore'
     },
     solanaRpc: {
       status: rpcStatus,
@@ -172,12 +176,63 @@ app.get(['/health', '/api/health'], (req, res) => {
   });
 });
 
-// API: Trader Wallets list with persistence metadata
-app.get('/api/trader-wallets', async (req, res) => {
+// --- API: User Auth & Cloud SQL Synchronization ---
+app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res) => {
   try {
+    if (!req.user || !req.user.uid) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: User not authenticated' });
+    }
+    const email = req.user.email || '';
+    const userId = req.user.uid;
+    
+    const userRef = adminFirestore.collection('users').doc(userId);
+    await userRef.set({
+      email,
+      lastSync: new Date().toISOString()
+    }, { merge: true });
+
+    res.json({ success: true, user: { uid: userId, email } });
+  } catch (err: any) {
+    console.error('[API] Error syncing user with Firestore:', err);
+    res.status(500).json({ success: false, error: err.message || 'Database synchronization failed' });
+  }
+});
+
+app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    res.json({
+      success: true,
+      user: {
+        uid: req.user?.uid,
+        email: req.user?.email,
+        name: req.user?.name,
+        picture: req.user?.picture
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// --- API: Trader Wallets Dedicated CRUD Endpoints ---
+
+// 1. READ: List all trader wallets with persistence metadata
+app.get('/api/trader-wallets', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.uid;
     const repo = TraderWalletRepository.getInstance(db);
-    const wallets = await repo.getTraderWallets();
-    const monitoring = repo.getMonitoringStatuses();
+    const wallets = await repo.getTraderWallets(userId);
+    // Since monitoring is global across users, we'll return all statuses or filter by user?
+    // Let's filter monitoring statuses by user's wallets.
+    const allMonitoring = repo.getMonitoringStatuses();
+    const userWalletIds = new Set(wallets.map(w => w.id));
+    const monitoring: Record<string, any> = {};
+    for (const [id, status] of Object.entries(allMonitoring)) {
+      if (userWalletIds.has(id)) {
+        monitoring[id] = status;
+      }
+    }
+    
     res.json({
       success: true,
       database: repo.getDbStatus(),
@@ -187,6 +242,113 @@ app.get('/api/trader-wallets', async (req, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || 'Failed to fetch trader wallets' });
+  }
+});
+
+// 2. CREATE: Add trader wallet
+app.post('/api/trader-wallets', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.uid;
+    const { name, wallet_address, enabled } = req.body || {};
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Trader name is required' });
+    }
+    if (!wallet_address || !isValidSolanaMint(wallet_address.trim())) {
+      return res.status(400).json({ success: false, error: 'Invalid Solana Public Key address' });
+    }
+
+    const repo = TraderWalletRepository.getInstance(db);
+    const added = await repo.addTraderWallet(userId, {
+      name: name.trim(),
+      wallet_address: wallet_address.trim(),
+      enabled: enabled !== undefined ? Boolean(enabled) : true
+    });
+
+    await setupLogsSubscription();
+    await broadcastState();
+    return res.status(201).json({ success: true, trader: added });
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to add trader wallet';
+    if (msg.includes('PERSISTENCE_UNAVAILABLE')) {
+      return res.status(503).json({ success: false, error: msg });
+    }
+    if (msg.includes('already exists')) {
+      return res.status(409).json({ success: false, error: msg });
+    }
+    return res.status(400).json({ success: false, error: msg });
+  }
+});
+
+// 3. TOGGLE / UPDATE: Update trader wallet status
+app.patch('/api/trader-wallets/:id', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.uid;
+    const { id } = req.params;
+    const { enabled } = req.body || {};
+    const repo = TraderWalletRepository.getInstance(db);
+    const updated = await repo.toggleTraderWallet(userId, id, enabled !== undefined ? Boolean(enabled) : undefined);
+
+    if (!updated) {
+      return res.status(404).json({ success: false, error: `Trader wallet ${id} not found` });
+    }
+
+    await setupLogsSubscription();
+    await broadcastState();
+    return res.json({ success: true, trader: updated });
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to update trader wallet';
+    if (msg.includes('PERSISTENCE_UNAVAILABLE')) {
+      return res.status(503).json({ success: false, error: msg });
+    }
+    return res.status(500).json({ success: false, error: msg });
+  }
+});
+
+app.post('/api/trader-wallets/:id/toggle', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.uid;
+    const { id } = req.params;
+    const { enabled } = req.body || {};
+    const repo = TraderWalletRepository.getInstance(db);
+    const updated = await repo.toggleTraderWallet(userId, id, enabled !== undefined ? Boolean(enabled) : undefined);
+
+    if (!updated) {
+      return res.status(404).json({ success: false, error: `Trader wallet ${id} not found` });
+    }
+
+    await setupLogsSubscription();
+    await broadcastState();
+    return res.json({ success: true, trader: updated });
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to update trader wallet';
+    if (msg.includes('PERSISTENCE_UNAVAILABLE')) {
+      return res.status(503).json({ success: false, error: msg });
+    }
+    return res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// 4. DELETE: Delete trader wallet
+app.delete('/api/trader-wallets/:id', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.uid;
+    const { id } = req.params;
+    const repo = TraderWalletRepository.getInstance(db);
+    const deleted = await repo.deleteTraderWallet(userId, id);
+
+    if (!deleted) {
+      return res.status(404).json({ success: false, error: `Trader wallet ${id} not found or already deleted` });
+    }
+
+    await setupLogsSubscription();
+    await broadcastState();
+    return res.json({ success: true, id });
+  } catch (err: any) {
+    const msg = err?.message || 'Failed to delete trader wallet';
+    if (msg.includes('PERSISTENCE_UNAVAILABLE')) {
+      return res.status(503).json({ success: false, error: msg });
+    }
+    return res.status(500).json({ success: false, error: msg });
   }
 });
 
@@ -236,7 +398,7 @@ app.get('/api/diagnostics/rpc', (req, res) => {
 // 2. Trader Wallet Monitoring Diagnostic Endpoint
 app.get('/api/diagnostics/traders', async (req, res) => {
   const repo = TraderWalletRepository.getInstance(db);
-  const wallets = await repo.getTraderWallets();
+  const wallets = await repo.getAllTraderWalletsGlobally();
   const statuses = repo.getMonitoringStatuses();
   const monitoredTxs = db.getMonitoredTransactions();
 
@@ -264,7 +426,7 @@ app.get('/api/diagnostics/traders', async (req, res) => {
   res.json({
     totalMonitoredTraders: wallets.length,
     activeMonitoredTraders: wallets.filter(w => w.enabled).length,
-    postgresActive: repo.isPostgresActive(),
+    firestoreActive: repo.getStorageMode() === 'FIRESTORE',
     traders: tradersDiagnostics
   });
 });
@@ -374,47 +536,7 @@ app.post('/api/action', async (req, res) => {
     const actionType = type || action;
     console.log(`[HTTP API] Received action: ${actionType}`);
 
-    if (actionType === 'ADD_TRADER') {
-      if (!isValidSolanaMint(data.wallet_address)) {
-        return res.status(400).json({ success: false, error: 'Invalid Solana Public Key address' });
-      }
-      try {
-        const repo = TraderWalletRepository.getInstance(db);
-        const added = await repo.addTraderWallet({
-          name: data.name,
-          wallet_address: data.wallet_address,
-          enabled: true
-        });
-        await setupLogsSubscription();
-        await broadcastState();
-        res.json({ success: true, trader: added });
-      } catch (err: any) {
-        res.status(400).json({ success: false, error: err?.message || 'Failed to add trader' });
-      }
-    }
-    else if (actionType === 'TOGGLE_TRADER') {
-      try {
-        const repo = TraderWalletRepository.getInstance(db);
-        const toggled = await repo.toggleTraderWallet(data.id, data.enabled);
-        await setupLogsSubscription();
-        await broadcastState();
-        res.json({ success: true, trader: toggled });
-      } catch (err: any) {
-        res.status(400).json({ success: false, error: err?.message || 'Failed to toggle trader' });
-      }
-    }
-    else if (actionType === 'DELETE_TRADER') {
-      try {
-        const repo = TraderWalletRepository.getInstance(db);
-        await repo.deleteTraderWallet(data.id);
-        await setupLogsSubscription();
-        await broadcastState();
-        res.json({ success: true, id: data.id });
-      } catch (err: any) {
-        res.status(400).json({ success: false, error: err?.message || 'Failed to delete trader' });
-      }
-    }
-    else if (actionType === 'UPDATE_SETTINGS') {
+    if (actionType === 'UPDATE_SETTINGS') {
       const updatePayload = { ...data };
       if (updatePayload.jupiter_api_key === '[CONFIGURED]') {
         delete updatePayload.jupiter_api_key;
@@ -431,20 +553,34 @@ app.post('/api/action', async (req, res) => {
       const positions = db.getPositions();
       const pos = positions.find(p => p.id === data.id);
       if (pos) {
-        await UnifiedExitService.getInstance(db).executeManualExit(pos, pos.current_price, () => {
-          broadcastState();
+        const gateway = ExecutionGateway.getInstance(db);
+        const result = await gateway.executeSell({
+          position: pos,
+          currentPriceSol: pos.current_price,
+          reason: 'MANUAL',
+          connection: solanaConnection
         });
+        broadcastState();
+        return res.json({ success: result.success, details: result.details });
       }
-      res.json({ success: true });
+      res.json({ success: false, error: 'POSITION_NOT_FOUND' });
     }
     else if (actionType === 'PARTIAL_SELL') {
+      // Partial selling is disabled - default to full close position
       const positions = db.getPositions();
       const pos = positions.find(p => p.id === data.id);
       if (pos) {
-        const ratio = typeof data.ratio === 'number' ? data.ratio : 0.5;
-        await executePartialSell(pos, ratio, 'MANUAL');
+        const gateway = ExecutionGateway.getInstance(db);
+        const result = await gateway.executeSell({
+          position: pos,
+          currentPriceSol: pos.current_price,
+          reason: 'MANUAL',
+          connection: solanaConnection
+        });
+        broadcastState();
+        return res.json({ success: result.success, details: result.details });
       }
-      res.json({ success: true });
+      res.json({ success: false, error: 'POSITION_NOT_FOUND' });
     }
     else if (actionType === 'RECONCILE_POSITION') {
       const positions = db.getPositions();
@@ -635,7 +771,7 @@ async function setupLogsSubscription() {
     return;
   }
 
-  const allTraders = await repo.getTraderWallets();
+  const allTraders = await repo.getAllTraderWalletsGlobally();
   const enabledTraders = allTraders.filter(t => t.enabled);
 
   if (enabledTraders.length === 0) {
@@ -902,49 +1038,31 @@ async function evaluateAndCopyToken(
 
   // If eligible, execute trade entry (PAPER vs REAL mainnet execution)
   if (isEligible) {
-    const priceSol = cachedSolUsdPrice > 0 ? (typeof price === 'number' ? price / cachedSolUsdPrice : 0.000001) : 0.000001;
-    const isRealMode = settings.trading_mode === 'MAINNET' || settings.mainnet_enabled === true;
+    const solUsdRate = livePriceService.getSolUsdPrice();
+    const priceSol = typeof price === 'number' && Number.isFinite(price) && price > 0 && solUsdRate > 0
+      ? price / solUsdRate
+      : 0;
 
-    if (!isRealMode) {
-      console.log(`[PaperExecution] Executing PAPER trade for ${tokenSymbol} (${mint})...`);
-      const paperPos = PaperExecutionService.getInstance(db).executeBuy(
-        mint,
-        tokenName,
-        tokenSymbol,
-        decimals,
-        priceSol,
-        trader.id,
-        trader.name,
-        buyDetails.signature
-      );
-      executionSnapshot = {
-        mode: 'PAPER',
-        status: 'CONFIRMED',
-        details: 'PAPER TRADE',
-        positionId: paperPos.mint
-      };
-    } else {
-      console.log(`[RealExecution] Executing REAL MAINNET trade for ${tokenSymbol} (${mint})...`);
-      const realResult = await RealExecutionService.getInstance(db).executeBuy(
-        mint,
-        tokenName,
-        tokenSymbol,
-        decimals,
-        priceSol,
-        trader.id,
-        trader.name,
-        buyDetails.signature,
-        solanaConnection
-      );
+    const gateway = ExecutionGateway.getInstance(db);
+    const result = await gateway.executeBuy({
+      mint,
+      tokenName,
+      tokenSymbol,
+      decimals,
+      priceSol,
+      trader,
+      buySignature: buyDetails.signature,
+      connection: solanaConnection
+    });
 
-      executionSnapshot = {
-        mode: 'MAINNET',
-        status: realResult.success ? 'CONFIRMED' : 'FAILED',
-        signature: realResult.signature,
-        error: realResult.error,
-        details: realResult.details
-      };
-    }
+    executionSnapshot = {
+      mode: result.mode,
+      status: result.status,
+      signature: result.signature,
+      errorReason: result.errorReason,
+      details: result.details,
+      positionId: result.position?.mint
+    };
   }
 
   // Record complete BuyAuthorizationAudit entry
@@ -1206,90 +1324,7 @@ function handleLivePriceUpdate(livePrice: LivePrice) {
   }
 }
 
-// Execute partial sell (e.g. 25%, 50%, 75%) on an active position
-async function executePartialSell(
-  pos: Position,
-  sellRatio: number, // 0.25, 0.50, etc. (between 0 and 1)
-  triggerReason: 'PARTIAL' | 'MANUAL' = 'PARTIAL'
-) {
-  if (sellRatio >= 1) {
-    // 100% full exit
-    await UnifiedExitService.getInstance(db, () => solanaConnection).executeManualExit(pos, pos.current_price, () => {
-      broadcastState();
-    });
-    return;
-  }
 
-  const decimals = typeof pos.tokenDecimals === 'number' ? pos.tokenDecimals : (pos.token_decimals || 6);
-  const originalBought = pos.tokenQuantity || formatTokenQuantity(pos.token_amount, decimals);
-  const currentRemainingNum = parseTokenQuantity(pos.remainingTokenQuantity || pos.tokenQuantity);
-  const tokensToSellNum = Number((currentRemainingNum * sellRatio).toFixed(decimals));
-  const newRemainingNum = Math.max(0, Number((currentRemainingNum - tokensToSellNum).toFixed(decimals)));
-
-  if (newRemainingNum <= 0) {
-    await UnifiedExitService.getInstance(db, () => solanaConnection).executeManualExit(pos, pos.current_price, () => {
-      broadcastState();
-    });
-    return;
-  }
-
-  const solOut = Number((tokensToSellNum * pos.current_price).toFixed(4));
-  const solInPortion = Number((pos.sol_in * sellRatio).toFixed(4));
-  const pnlSol = Number((solOut - solInPortion).toFixed(4));
-  const pnlPercent = solInPortion > 0 ? Number(((pnlSol / solInPortion) * 100).toFixed(2)) : 0;
-
-  // Restore proceeds to paper balance
-  const settings = db.getSettings();
-  db.updateSettings({ paper_balance_sol: Number((settings.paper_balance_sol + solOut).toFixed(4)) });
-
-  const remainingFormatted = formatTokenQuantity(newRemainingNum, decimals);
-  const newSolIn = Number((pos.sol_in - solInPortion).toFixed(4));
-  const newCurrentValue = Number((newRemainingNum * pos.current_price).toFixed(4));
-
-  // Update active position with new remaining quantity
-  db.updatePosition(pos.id, {
-    remainingTokenQuantity: remainingFormatted,
-    remainingQuantity: remainingFormatted,
-    token_amount: newRemainingNum,
-    sol_in: newSolIn,
-    investedAmount: `${newSolIn.toFixed(4)} SOL`,
-    current_value_sol: newCurrentValue,
-    currentValue: `${newCurrentValue.toFixed(4)} SOL`
-  });
-
-  // Log trade entry for the partial sell
-  const partialTrade = db.addTrade({
-    position_id: pos.id,
-    token_mint: pos.token_mint,
-    token_name: pos.token_name,
-    token_symbol: pos.token_symbol,
-    source_trader_id: pos.source_trader_id,
-    source_trader_name: pos.source_trader_name,
-    buy_signature: pos.buy_signature,
-    sell_signature: `${pos.buy_signature}_partial_${Date.now()}`,
-    sol_in: solInPortion,
-    token_amount_bought: parseTokenQuantity(originalBought),
-    tokenQuantityBought: originalBought,
-    token_amount_sold: tokensToSellNum,
-    tokenQuantitySold: formatTokenQuantity(tokensToSellNum, decimals),
-    remainingQuantity: remainingFormatted,
-    sol_out: solOut,
-    entry_price: pos.entry_price,
-    exit_price: pos.current_price,
-    buy_time: pos.buy_time,
-    sell_time: new Date().toISOString(),
-    pnl_sol: pnlSol,
-    pnl_percent: pnlPercent,
-    sell_reason: triggerReason,
-    mode: settings.trading_mode
-  });
-
-  // Learn from completed partial trade
-  aiLearningEngine.learnFromCompletedTrade(partialTrade, pos);
-
-  console.log(`[Partial Sell] Sold ${formatTokenQuantity(tokensToSellNum, decimals)} of ${pos.token_symbol}. Remaining: ${remainingFormatted} tokens.`);
-  broadcastState();
-}
 
 // On-chain wallet balance cross-check
 async function reconcilePositionWithOnChainBalance(pos: Position): Promise<{ matched: boolean; onChainAmount?: number; message: string }> {
@@ -1394,40 +1429,7 @@ wss.on('connection', async (ws) => {
       const actionType = type || action;
       console.log(`[WS] Received action: ${actionType}`);
 
-      if (actionType === 'ADD_TRADER') {
-        if (!isValidSolanaMint(data.wallet_address)) {
-          ws.send(JSON.stringify({ type: 'ERROR', message: 'Invalid Solana Public Key address' }));
-          return;
-        }
-        try {
-          const repo = TraderWalletRepository.getInstance(db);
-          await repo.addTraderWallet({
-            name: data.name,
-            wallet_address: data.wallet_address,
-            enabled: true
-          });
-          await setupLogsSubscription();
-          await broadcastState();
-        } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'ERROR', message: err?.message || 'Failed to add trader' }));
-        }
-      }
-
-      else if (actionType === 'TOGGLE_TRADER') {
-        const repo = TraderWalletRepository.getInstance(db);
-        await repo.toggleTraderWallet(data.id, data.enabled);
-        await setupLogsSubscription();
-        await broadcastState();
-      }
-
-      else if (actionType === 'DELETE_TRADER') {
-        const repo = TraderWalletRepository.getInstance(db);
-        await repo.deleteTraderWallet(data.id);
-        await setupLogsSubscription();
-        await broadcastState();
-      }
-
-      else if (actionType === 'UPDATE_SETTINGS') {
+      if (actionType === 'UPDATE_SETTINGS') {
         const updatePayload = { ...data };
         if (updatePayload.jupiter_api_key === '[CONFIGURED]') {
           delete updatePayload.jupiter_api_key;
@@ -1454,8 +1456,14 @@ wss.on('connection', async (ws) => {
         const positions = db.getPositions();
         const pos = positions.find(p => p.id === data.id);
         if (pos) {
-          const ratio = typeof data.ratio === 'number' ? data.ratio : 0.5;
-          await executePartialSell(pos, ratio, 'MANUAL');
+          const gateway = ExecutionGateway.getInstance(db);
+          await gateway.executeSell({
+            position: pos,
+            currentPriceSol: pos.current_price,
+            reason: 'MANUAL',
+            connection: solanaConnection
+          });
+          broadcastState();
         }
       }
 

@@ -31,14 +31,14 @@ export interface PositionPnLUpdate {
   isStale: boolean;
 }
 
-class LivePriceService {
+export class LivePriceService {
   private cache: Map<string, LivePrice> = new Map();
   private listeners: Map<string, Set<PriceUpdateListener>> = new Map();
   private globalListeners: Set<PriceUpdateListener> = new Set();
   
   private monitorInterval: NodeJS.Timeout | null = null;
   private isRunning: boolean = false;
-  private solUsdPrice: number = 160.0;
+  private solUsdPrice: number = 0;
   private lastSolPriceUpdate: number = 0;
   
   // Stale threshold: 15 seconds
@@ -78,7 +78,10 @@ class LivePriceService {
    * Get current authoritative SOL/USD price
    */
   public getSolUsdPrice(): number {
-    return this.solUsdPrice > 0 ? this.solUsdPrice : 160.0;
+    if (this.solUsdPrice <= 0 && Date.now() - this.lastSolPriceUpdate > 5000) {
+      this.refreshSolPrice().catch(() => {});
+    }
+    return this.solUsdPrice;
   }
 
   /**

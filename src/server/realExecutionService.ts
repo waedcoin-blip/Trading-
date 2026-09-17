@@ -8,6 +8,7 @@ import { SolanaRpcQueue } from './rpcQueue';
 export interface RealExecutionResult {
   success: boolean;
   signature?: string;
+  solOut?: number;
   error?: string;
   details?: string;
 }

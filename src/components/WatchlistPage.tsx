@@ -14,6 +14,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { ServerState, TraderWallet, TokenObservation } from '../types';
 import { isValidSolanaMint } from '../utils/solana';
+import { auth } from '../lib/firebase';
 
 interface WatchlistPageProps {
   state: ServerState;
@@ -21,12 +22,38 @@ interface WatchlistPageProps {
 }
 
 export default function WatchlistPage({ state, sendAction }: WatchlistPageProps) {
-  const { traders, observations, discoveryFeed } = state;
+  const { observations, discoveryFeed } = state;
+  const [traders, setTraders] = useState<TraderWallet[]>([]);
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [error, setError] = useState('');
   const [isManualRefreshing, setIsManualRefreshing] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState<number>(120);
+
+  // Fetch traders on mount and interval
+  React.useEffect(() => {
+    fetchTraders();
+    const interval = setInterval(fetchTraders, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const fetchTraders = async () => {
+    try {
+      const token = await getAuthToken();
+      if (!token) return;
+      const res = await fetch('/api/trader-wallets', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.traders) {
+          setTraders(data.traders);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch trader wallets:', err);
+    }
+  };
 
   // Filter observations to guarantee only genuine Solana mints are ever rendered
   const validObservations = observations.filter(obs => isValidSolanaMint(obs.token_mint));
@@ -57,6 +84,10 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
+  const getAuthToken = async () => {
+    return auth.currentUser ? await auth.currentUser.getIdToken() : null;
+  };
+
   const handleManualRefresh = async () => {
     if (isManualRefreshing) return;
     setIsManualRefreshing(true);
@@ -69,12 +100,12 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
     }
   };
 
-  const handleAddTrader = (e: React.FormEvent) => {
+  const handleAddTrader = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
     if (state.connection?.databaseMode === 'UNAVAILABLE') {
-      setError('Trader wallet was not saved permanently. PostgreSQL persistence is not configured on the server.');
+      setError('Trader wallet persistence is unavailable. Firebase Firestore is not configured or connection failed.');
       return;
     }
 
@@ -94,19 +125,67 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
       return;
     }
 
-    sendAction('ADD_TRADER', { name: name.trim(), wallet_address: address.trim() });
-    setName('');
-    setAddress('');
+    try {
+      const token = await getAuthToken();
+      const res = await fetch('/api/trader-wallets', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ name: name.trim(), wallet_address: address.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to add trader wallet');
+      }
+      setName('');
+      setAddress('');
+    } catch (err: any) {
+      setError(err.message);
+    }
   };
+
+  const handleToggleTrader = async (id: string, enabled: boolean) => {
+    try {
+      const token = await getAuthToken();
+      await fetch(`/api/trader-wallets/${id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ enabled })
+      });
+    } catch (err) {
+      console.error('Failed to toggle trader:', err);
+    }
+  };
+
+  const handleDeleteTrader = async (id: string) => {
+    try {
+      const token = await getAuthToken();
+      await fetch(`/api/trader-wallets/${id}`, {
+        method: 'DELETE',
+        headers: {
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        }
+      });
+    } catch (err) {
+      console.error('Failed to delete trader:', err);
+    }
+  };
+
+  const isPersistenceUnavailable = state.connection?.databaseMode === 'UNAVAILABLE';
 
   return (
     <div className="space-y-6" id="watchlist_container">
-      {state.connection?.databaseMode === 'UNAVAILABLE' && (
+      {isPersistenceUnavailable && (
         <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 p-4 rounded-lg flex items-start gap-3 text-xs" id="db_unavailable_banner">
           <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5 text-amber-500" />
           <div>
             <span className="font-bold block text-sm mb-1">⚠️ Database Persistence Unavailable</span>
-            PostgreSQL persistence is not configured on the server (DATABASE_URL is missing or connection failed).
+            Firebase Firestore persistence is not configured on the server.
             Trader wallets cannot be added, toggled, or deleted. Operating in monitoring-only or read-only mode.
           </div>
         </div>
@@ -129,7 +208,8 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. Whale Trader 1"
-                className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-3 py-2 text-sm text-[#f3f4f6] focus:outline-none focus:border-[#3b82f6] placeholder-[#4b5563]"
+                disabled={isPersistenceUnavailable}
+                className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-3 py-2 text-sm text-[#f3f4f6] focus:outline-none focus:border-[#3b82f6] placeholder-[#4b5563] disabled:opacity-50"
               />
             </div>
 
@@ -140,7 +220,8 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
                 value={address}
                 onChange={(e) => setAddress(e.target.value)}
                 placeholder="Real Solana Base58 Address"
-                className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-3 py-2 text-sm text-[#f3f4f6] focus:outline-none focus:border-[#3b82f6] placeholder-[#4b5563] font-mono text-xs"
+                disabled={isPersistenceUnavailable}
+                className="w-full bg-[#0b0e14] border border-[#1e2533] rounded px-3 py-2 text-sm text-[#f3f4f6] focus:outline-none focus:border-[#3b82f6] placeholder-[#4b5563] font-mono text-xs disabled:opacity-50"
               />
             </div>
 
@@ -153,7 +234,13 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
 
             <button 
               type="submit"
-              className="w-full bg-[#3b82f6] hover:bg-[#2563eb] text-white text-xs font-semibold py-2.5 px-4 rounded transition flex items-center justify-center gap-1.5 cursor-pointer"
+              disabled={isPersistenceUnavailable}
+              title={isPersistenceUnavailable ? 'Trader wallet persistence is unavailable on the server.' : undefined}
+              className={`w-full text-white text-xs font-semibold py-2.5 px-4 rounded transition flex items-center justify-center gap-1.5 ${
+                isPersistenceUnavailable
+                  ? 'bg-[#3b82f6]/40 cursor-not-allowed text-white/60'
+                  : 'bg-[#3b82f6] hover:bg-[#2563eb] cursor-pointer'
+              }`}
             >
               <Plus className="w-4 h-4" />
               ADD TRADER
@@ -218,18 +305,28 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
                         <td className="py-3 text-right">
                           <div className="flex justify-end gap-2">
                             <button 
-                              onClick={() => sendAction('TOGGLE_TRADER', { id: trader.id, enabled: !trader.enabled })}
-                              className={`px-2 py-1 rounded text-[10px] font-semibold border cursor-pointer ${
-                                trader.enabled 
-                                  ? 'border-[#ef4444]/20 hover:bg-[#ef4444]/10 text-[#f87171]' 
-                                  : 'border-[#10b981]/20 hover:bg-[#10b981]/10 text-[#34d399]'
+                              disabled={isPersistenceUnavailable}
+                              title={isPersistenceUnavailable ? 'Trader wallet persistence is unavailable on the server.' : undefined}
+                              onClick={() => !isPersistenceUnavailable && handleToggleTrader(trader.id, !trader.enabled)}
+                              className={`px-2 py-1 rounded text-[10px] font-semibold border ${
+                                isPersistenceUnavailable
+                                  ? 'border-gray-700/50 text-gray-500 cursor-not-allowed opacity-50'
+                                  : trader.enabled 
+                                    ? 'border-[#ef4444]/20 hover:bg-[#ef4444]/10 text-[#f87171] cursor-pointer' 
+                                    : 'border-[#10b981]/20 hover:bg-[#10b981]/10 text-[#34d399] cursor-pointer'
                               }`}
                             >
                               {trader.enabled ? 'DISABLE' : 'ENABLE'}
                             </button>
                             <button 
-                              onClick={() => sendAction('DELETE_TRADER', { id: trader.id })}
-                              className="p-1 text-[#6b7280] hover:text-[#f87171] rounded hover:bg-[#ef4444]/10 cursor-pointer"
+                              disabled={isPersistenceUnavailable}
+                              title={isPersistenceUnavailable ? 'Trader wallet persistence is unavailable on the server.' : undefined}
+                              onClick={() => !isPersistenceUnavailable && handleDeleteTrader(trader.id)}
+                              className={`p-1 rounded ${
+                                isPersistenceUnavailable
+                                  ? 'text-gray-600 cursor-not-allowed opacity-50'
+                                  : 'text-[#6b7280] hover:text-[#f87171] hover:bg-[#ef4444]/10 cursor-pointer'
+                              }`}
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>

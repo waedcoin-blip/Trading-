@@ -18,6 +18,7 @@ import WatchlistPage from './components/WatchlistPage';
 import TradingPage from './components/TradingPage';
 import SettingsPage from './components/SettingsPage';
 import AILearningPage from './components/AILearningPage';
+import { UserAuthButton } from './components/UserAuthButton.tsx';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'watchlist' | 'trading' | 'ai-learning' | 'settings'>('watchlist');
@@ -153,7 +154,7 @@ export default function App() {
             const updatedPositions = prevState.positions.map(p => {
               if (p.id === positionId || p.token_mint === mint) {
                 const currentPriceUsdFormatted = `$${currentPriceUsd < 0.01 ? currentPriceUsd.toFixed(8) : currentPriceUsd.toFixed(4)}`;
-                const currentValueUsdFormatted = `$${(currentValueSol * (solUsdRate || 160.0)).toFixed(2)}`;
+                const currentValueUsdFormatted = solUsdRate > 0 ? `$${(currentValueSol * solUsdRate).toFixed(2)}` : '$0.00';
                 return {
                   ...p,
                   current_price: currentPriceSol,
@@ -387,26 +388,29 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Global Connection Signals */}
-        <div className="hidden lg:flex items-center gap-4 text-[10px]">
-          <div className="flex items-center gap-1.5">
-            <span className="text-[#6b7280]">RPC:</span>
-            <span className={`font-bold ${connection.rpc === 'CONNECTED' ? 'text-emerald-400' : 'text-red-400'}`}>
-              {connection.rpc}
-            </span>
+        {/* Global Connection Signals & Auth */}
+        <div className="flex items-center gap-3 md:gap-4">
+          <div className="hidden lg:flex items-center gap-4 text-[10px]">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#6b7280]">RPC:</span>
+              <span className={`font-bold ${connection.rpc === 'CONNECTED' ? 'text-emerald-400' : 'text-red-400'}`}>
+                {connection.rpc}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#6b7280]">WSS:</span>
+              <span className={`font-bold ${connection.wss === 'CONNECTED' ? 'text-emerald-400' : 'text-red-400'}`}>
+                {connection.wss}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#6b7280]">MODE:</span>
+              <span className={`font-bold uppercase ${settings.trading_mode === 'PAPER' ? 'text-emerald-400' : 'text-red-400'}`}>
+                {settings.trading_mode}
+              </span>
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-[#6b7280]">WSS:</span>
-            <span className={`font-bold ${connection.wss === 'CONNECTED' ? 'text-emerald-400' : 'text-red-400'}`}>
-              {connection.wss}
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-[#6b7280]">MODE:</span>
-            <span className={`font-bold uppercase ${settings.trading_mode === 'PAPER' ? 'text-emerald-400' : 'text-red-400'}`}>
-              {settings.trading_mode}
-            </span>
-          </div>
+          <UserAuthButton />
         </div>
 
       </header>

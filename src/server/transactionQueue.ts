@@ -7,8 +7,8 @@ import { MomentumService } from './momentumService';
 import { BuyAuthorizationService } from './buyAuthorization';
 import { getRugCheckReport, validateRugCheck } from './rugcheck';
 import { scoreToken } from './ai';
-import { PaperExecutionService } from './paperExecutionService';
-import { RealExecutionService } from './realExecutionService';
+import { ExecutionGateway } from './executionGateway';
+import { livePriceService } from './priceService';
 import { jupiterService } from './jupiterService';
 import { SolanaRpcQueue } from './rpcQueue';
 import { TransactionClassifier } from './transactionClassifier';
@@ -484,7 +484,7 @@ export class SolanaTransactionQueue {
       market: {
         tokenMint: mint,
         priceUSD: price,
-        priceSOL: price / 160.0,
+        priceSOL: livePriceService.getSolUsdPrice() > 0 ? price / livePriceService.getSolUsdPrice() : 0,
         marketCapUSD: marketCap,
         liquidityUSD: liquidity,
         volumeUSD24h: volume24h,
@@ -558,42 +558,34 @@ export class SolanaTransactionQueue {
 
     console.log(`[BUY_AUTHORIZED] mint=${mint} symbol=${tokenSymbol} trader=${trader.name}`);
 
-    // Execute Trade Entry (PAPER vs REAL)
-    const priceSol = typeof price === 'number' ? price / 160.0 : 0.000001;
-    const isRealMode = settings.trading_mode === 'MAINNET' || settings.mainnet_enabled === true;
+    // Compute priceSOL using authoritative livePriceService SOL/USD rate
+    const solUsdRate = livePriceService.getSolUsdPrice();
+    const priceSol = typeof price === 'number' && Number.isFinite(price) && price > 0 && solUsdRate > 0
+      ? price / solUsdRate
+      : 0;
 
-    if (!isRealMode) {
-      console.log(`[EXECUTION] mint=${mint} mode=PAPER status=SUBMITTED`);
-      const paperPos = PaperExecutionService.getInstance(this.db).executeBuy(
-        mint,
-        tokenName,
-        tokenSymbol,
-        decimals,
-        priceSol,
-        trader.id,
-        trader.name,
-        buyDetails.signature
-      );
-      console.log(`[EXECUTION] mint=${mint} mode=PAPER status=CONFIRMED posId=${paperPos.mint}`);
+    if (priceSol <= 0) {
+      console.error(`[EXECUTION_REJECTED] Invalid price data for ${tokenSymbol} (${mint}). price=${price}, solUsdRate=${solUsdRate}`);
+      return;
+    }
+
+    // Execute Trade Entry via Centralized ExecutionGateway
+    const gateway = ExecutionGateway.getInstance(this.db);
+    const result = await gateway.executeBuy({
+      mint,
+      tokenName,
+      tokenSymbol,
+      decimals,
+      priceSol,
+      trader,
+      buySignature: buyDetails.signature,
+      connection: this.connectionSupplier()
+    });
+
+    if (result.success) {
+      console.log(`[EXECUTION_CONFIRMED] mint=${mint} mode=${result.mode} status=${result.status}`);
     } else {
-      console.log(`[EXECUTION] mint=${mint} mode=REAL status=SUBMITTED`);
-      const realResult = await RealExecutionService.getInstance(this.db).executeBuy(
-        mint,
-        tokenName,
-        tokenSymbol,
-        decimals,
-        priceSol,
-        trader.id,
-        trader.name,
-        buyDetails.signature,
-        this.connectionSupplier()
-      );
-
-      if (realResult.success) {
-        console.log(`[EXECUTION] mint=${mint} mode=REAL status=CONFIRMED sig=${realResult.signature}`);
-      } else {
-        console.error(`[EXECUTION] mint=${mint} mode=REAL outcome=FAILED_EXECUTION error=${realResult.error}`);
-      }
+      console.error(`[EXECUTION_FAILED] mint=${mint} mode=${result.mode} reason=${result.errorReason} details=${result.details}`);
     }
   }
 

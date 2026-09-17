@@ -3,7 +3,7 @@ import { Position, Trade, Settings } from '../types';
 import { aiLearningEngine } from './aiLearningEngine';
 import { RebuyGuard } from './rebuyGuard';
 import { Connection } from '@solana/web3.js';
-import { RealExecutionService } from './realExecutionService';
+import { ExecutionGateway } from './executionGateway';
 
 export class UnifiedExitService {
   private static instance: UnifiedExitService;
@@ -87,7 +87,10 @@ export class UnifiedExitService {
     });
 
     // Skip exits if price source is marked as stale
-    if (isStale) return;
+    if (isStale) {
+      console.warn(`[Exit Engine] Exit trigger evaluation suppressed for ${pos.token_symbol} (${pos.token_mint}): Price data is marked STALE.`);
+      return;
+    }
 
     let triggerReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'STAGNANT' | null = null;
 
@@ -170,91 +173,31 @@ export class UnifiedExitService {
   ): Promise<Trade | null> {
     console.log(`[Exit Engine] Executing full exit for ${pos.token_symbol} (${pos.token_mint}). Reason: ${reason}. PnL: ${pnlPercent}%`);
 
-    const decimals = typeof pos.tokenDecimals === 'number' ? pos.tokenDecimals : (pos.token_decimals || 6);
-    const remainingNum = this.parseTokenQuantity(pos.remainingTokenQuantity || pos.tokenQuantity);
-    const settings = this.db.getSettings();
-    const isRealMode = settings.trading_mode === 'MAINNET' || settings.mainnet_enabled === true;
+    const gateway = ExecutionGateway.getInstance(this.db);
+    const conn = this.connectionSupplier ? this.connectionSupplier() : null;
 
-    let actualSellSignature = pos.buy_signature + '_exit_' + Date.now();
-    let actualSolOut = solOut;
-    let actualPnlSol = pnlSol;
-    let actualPnlPercent = pnlPercent;
-
-    // In REAL mode, perform on-chain execution first
-    if (isRealMode) {
-      const conn = this.connectionSupplier ? this.connectionSupplier() : null;
-      console.log(`[Exit Engine] Initiating REAL on-chain SELL for ${pos.token_symbol} (${pos.token_mint})...`);
-      const sellResult = await RealExecutionService.getInstance(this.db).executeSell(
-        pos.token_mint,
-        remainingNum,
-        decimals,
-        conn
-      );
-
-      if (!sellResult.success) {
-        console.error(`[Exit Engine] REAL on-chain SELL failed for ${pos.token_symbol}: ${sellResult.error} (${sellResult.details})`);
-        return null;
-      }
-
-      actualSellSignature = sellResult.signature || actualSellSignature;
-      if (typeof sellResult.solOut === 'number' && sellResult.solOut > 0) {
-        actualSolOut = Number(sellResult.solOut.toFixed(4));
-        actualPnlSol = Number((actualSolOut - pos.sol_in).toFixed(4));
-        actualPnlPercent = pos.sol_in > 0 ? Number(((actualPnlSol / pos.sol_in) * 100).toFixed(2)) : 0;
-      }
-    }
-
-    // 1. Mark position as SOLD
-    this.db.updatePosition(pos.id, { 
-      status: 'SOLD', 
-      remainingTokenQuantity: '0', 
-      remainingQuantity: '0' 
-    });
-    
-    // Remove from active list
-    this.db.deletePosition(pos.id);
-
-    // 2. Restore paper balance with output SOL if paper mode
-    if (!isRealMode) {
-      const updatedBalance = Number((settings.paper_balance_sol + actualSolOut).toFixed(4));
-      this.db.updateSettings({ paper_balance_sol: updatedBalance });
-    }
-
-    // 3. Record completed trade
-    const completedTrade = this.db.addTrade({
-      position_id: pos.id,
-      token_mint: pos.token_mint,
-      token_name: pos.token_name,
-      token_symbol: pos.token_symbol,
-      source_trader_id: pos.source_trader_id,
-      source_trader_name: pos.source_trader_name,
-      buy_signature: pos.buy_signature,
-      sell_signature: actualSellSignature,
-      sol_in: pos.sol_in,
-      token_amount_bought: this.parseTokenQuantity(pos.tokenQuantity),
-      tokenQuantityBought: pos.tokenQuantity,
-      token_amount_sold: remainingNum,
-      tokenQuantitySold: this.formatTokenQuantity(remainingNum, decimals),
-      remainingQuantity: '0',
-      sol_out: actualSolOut,
-      entry_price: pos.entry_price,
-      exit_price: exitPrice,
-      buy_time: pos.buy_time,
-      sell_time: new Date().toISOString(),
-      pnl_sol: actualPnlSol,
-      pnl_percent: actualPnlPercent,
-      sell_reason: reason,
-      mode: settings.trading_mode
+    const result = await gateway.executeSell({
+      position: pos,
+      currentPriceSol: exitPrice,
+      reason,
+      connection: conn
     });
 
-    // 4. Feed Completed Trade to AI Learning Engine
+    if (!result.success || !result.trade) {
+      console.error(`[Exit Engine] Full exit failed for ${pos.token_symbol}: ${result.errorReason} (${result.details})`);
+      return null;
+    }
+
+    const completedTrade = result.trade;
+
+    // Feed Completed Trade to AI Learning Engine
     try {
       aiLearningEngine.learnFromCompletedTrade(completedTrade, pos);
     } catch (err) {
       console.error('[Exit Engine] AI learning update failed:', err);
     }
 
-    // 5. Update RebuyGuard state
+    // Update RebuyGuard state
     try {
       await RebuyGuard.onPositionExited({
         mint: pos.token_mint,
@@ -263,7 +206,7 @@ export class UnifiedExitService {
         entryPrice: pos.entry_price,
         exitPrice,
         entryCost: pos.sol_in,
-        exitProceeds: solOut,
+        exitProceeds: result.trade.sol_out || solOut,
         fees: 0,
         sellReason: reason
       });
@@ -271,7 +214,7 @@ export class UnifiedExitService {
       console.error('[Exit Engine] RebuyGuard exit update failed:', err);
     }
 
-    console.log(`[Exit Engine] SOLD SUCCESS: Sold 100% of ${pos.token_symbol} for ${solOut.toFixed(4)} SOL.`);
+    console.log(`[Exit Engine] SOLD SUCCESS: Sold 100% of ${pos.token_symbol} for ${(result.trade.sol_out || solOut).toFixed(4)} SOL.`);
     return completedTrade;
   }
 }

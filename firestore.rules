@@ -1,0 +1,64 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper function to check if user is operating on their own resource
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User profile documents
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+                    && request.resource.data.id == userId
+                    && request.resource.data.email is string;
+      allow update: if isOwner(userId)
+                    && request.resource.data.id == userId;
+      allow delete: if isOwner(userId);
+
+      // User's private trader wallets subcollection
+      match /trader_wallets/{walletId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+                      && request.resource.data.userId == userId
+                      && request.resource.data.walletAddress is string
+                      && request.resource.data.name is string;
+        allow update: if isOwner(userId)
+                      && request.resource.data.userId == userId;
+        allow delete: if isOwner(userId);
+      }
+
+      // Paper trading subcollections
+      match /paper_portfolios/{portfolioId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /paper_positions/{positionId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /paper_trades/{tradeId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /paper_execution_records/{recordId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Connection test document for validating Firestore connectivity
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Fallback: Deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
