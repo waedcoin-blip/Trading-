@@ -40,9 +40,7 @@ import { SolanaRpcQueue } from './src/server/rpcQueue.js';
 import { PipelineDiagnostics } from './src/types.js';
 
 // Environment-resilient directory resolution for CJS and ESM execution
-const appDir = typeof __dirname !== 'undefined'
-  ? __dirname
-  : (import.meta && import.meta.url ? path.dirname(fileURLToPath(import.meta.url)) : process.cwd());
+const appDir = typeof __dirname !== 'undefined' ? __dirname : process.cwd();
 
 const app = express();
 const server = http.createServer(app);
@@ -59,6 +57,7 @@ async function getSanitizedState() {
   delete (sanitizedSettings as any).jupiter_api_key;
 
   currentConnectionStatus.jupiter = jupiterService.getStatus();
+  currentConnectionStatus.databaseMode = TraderWalletRepository.getInstance(db).getStorageMode();
 
   const traderWallets = await TraderWalletRepository.getInstance(db).getTraderWallets();
   const traderStatuses = TraderWalletRepository.getInstance(db).getMonitoringStatuses();
@@ -140,8 +139,8 @@ app.get(['/health', '/api/health'], (req, res) => {
     service: 'trading-server',
     uptimeSec: Math.floor(process.uptime()),
     database: {
-      type: repo.getStorageMode() === 'postgres' ? 'postgres' : 'json',
-      connected: repo.getDbStatus() === 'connected',
+      mode: repo.getStorageMode(),
+      status: repo.getDbStatus(),
       traderWalletCount: repo.getTraderWalletCount()
     },
     solanaRpc: {
@@ -160,6 +159,7 @@ app.get(['/health', '/api/health'], (req, res) => {
       failed: txMetrics.failedPermanentlyCount
     },
     monitoring: {
+      status: solanaConnection ? 'HEALTHY' : 'DISCONNECTED',
       activeSubscriptions: activeLogSubscriptions.length,
       enabledTraders: repo.getEnabledTraderWalletCount()
     },
@@ -629,6 +629,12 @@ async function setupLogsSubscription() {
   activeLogSubscriptions = [];
 
   const repo = TraderWalletRepository.getInstance(db);
+  if (repo.getStorageMode() === 'UNAVAILABLE') {
+    console.error('[TraderWalletRepository] storage unavailable');
+    console.warn('[TraderMonitor] waiting for persistent storage');
+    return;
+  }
+
   const allTraders = await repo.getTraderWallets();
   const enabledTraders = allTraders.filter(t => t.enabled);
 

@@ -73,6 +73,11 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
     e.preventDefault();
     setError('');
 
+    if (state.connection?.databaseMode === 'UNAVAILABLE') {
+      setError('Trader wallet was not saved permanently. PostgreSQL persistence is not configured on the server.');
+      return;
+    }
+
     if (!name.trim()) {
       setError('Trader name is required');
       return;
@@ -96,6 +101,16 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
 
   return (
     <div className="space-y-6" id="watchlist_container">
+      {state.connection?.databaseMode === 'UNAVAILABLE' && (
+        <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 p-4 rounded-lg flex items-start gap-3 text-xs" id="db_unavailable_banner">
+          <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5 text-amber-500" />
+          <div>
+            <span className="font-bold block text-sm mb-1">⚠️ Database Persistence Unavailable</span>
+            PostgreSQL persistence is not configured on the server (DATABASE_URL is missing or connection failed).
+            Trader wallets cannot be added, toggled, or deleted. Operating in monitoring-only or read-only mode.
+          </div>
+        </div>
+      )}
       {/* Upper Grid: Add Trader and Status */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         

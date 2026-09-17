@@ -284,6 +284,7 @@ export interface ConnectionStatus {
   pipeline?: PipelineDiagnostics;
   traderStatuses?: Record<string, TraderMonitoringStatus>;
   queueMetrics?: any;
+  databaseMode?: 'POSTGRES' | 'LOCAL_JSON' | 'UNAVAILABLE';
 }
 
 export interface TradeAuditRecord {
