@@ -1366,7 +1366,7 @@ livePriceService.startLiveMonitoring(
 setInterval(updateSolUsdPrice, 60000);
 
 // WebSocket Connection Handlers
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   console.log('[WS] Client connected');
   clients.add(ws);
 
