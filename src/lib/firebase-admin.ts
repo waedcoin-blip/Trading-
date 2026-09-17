@@ -102,7 +102,7 @@ if (creds) {
     isExplicitCredentialConfigured = false;
   }
 } else {
-  console.warn('[FIREBASE] ERROR: Firestore production credentials are not configured.');
+  console.warn('[FIREBASE] Fallback: Firestore production credentials are not configured.');
   console.warn('[FIREBASE] Expected configured credential environment variables: FIREBASE_SERVICE_ACCOUNT_JSON OR (FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY).');
   console.warn('[FIREBASE] ADC fallback prevented. Operating in fallback mode (Firestore persistence disabled).');
 }

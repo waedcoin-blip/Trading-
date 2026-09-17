@@ -44,6 +44,7 @@ export const requireAuth = async (
       if (payload.exp && payload.exp > nowSec && (payload.aud === targetProjectId || payload.iss?.includes(targetProjectId))) {
         req.user = {
           uid: payload.user_id || payload.sub,
+          sub: payload.sub || payload.user_id || '',
           email: payload.email || '',
           name: payload.name || '',
           picture: payload.picture || '',
@@ -53,7 +54,7 @@ export const requireAuth = async (
           iat: payload.iat,
           exp: payload.exp,
           firebase: payload.firebase || { sign_in_provider: 'google.com', identities: {} }
-        } as DecodedIdToken;
+        } as unknown as DecodedIdToken;
         return next();
       }
     }
