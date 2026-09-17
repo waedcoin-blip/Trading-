@@ -547,6 +547,21 @@ async function runPipelineTests() {
   // Scenario 9-11: Validate partial sell removal
   assert(typeof (db as any).executePartialSell === 'undefined', 'executePartialSell function removed from server db');
 
+  // TEST 10: Firebase Production Authentication & ADC Fallback Prevention
+  console.log('\n--- TEST 10: Firebase Production Authentication & ADC Prevention ---');
+  const { isFirebaseConfigured, adminFirestore: testAdminFs } = await import('../../lib/firebase-admin.js');
+  const hasExplicitEnv = Boolean(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT ||
+    (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY)
+  );
+  assert(isFirebaseConfigured === hasExplicitEnv, 'isFirebaseConfigured correctly reflects presence of explicit credentials');
+  if (!hasExplicitEnv) {
+    assert(testAdminFs === null, 'adminFirestore is null when explicit credentials are missing (ADC fallback prevented)');
+  } else {
+    assert(Boolean(testAdminFs) === true, 'adminFirestore is initialized when explicit credentials are present');
+  }
+
   console.log(`\n=== PIPELINE VERIFICATION SUMMARY: ${failures === 0 ? 'ALL TESTS PASSED SUCCESSFULLY' : `${failures} TEST(S) FAILED`} ===`);
   if (failures > 0) {
     process.exit(1);

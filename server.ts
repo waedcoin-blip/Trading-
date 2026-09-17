@@ -185,11 +185,13 @@ app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res) => {
     const email = req.user.email || '';
     const userId = req.user.uid;
     
-    const userRef = adminFirestore.collection('users').doc(userId);
-    await userRef.set({
-      email,
-      lastSync: new Date().toISOString()
-    }, { merge: true });
+    if (adminFirestore) {
+      const userRef = adminFirestore.collection('users').doc(userId);
+      await userRef.set({
+        email,
+        lastSync: new Date().toISOString()
+      }, { merge: true });
+    }
 
     res.json({ success: true, user: { uid: userId, email } });
   } catch (err: any) {

@@ -16,6 +16,10 @@ export const requireAuth = async (
     return res.status(401).json({ error: 'Unauthorized: Missing token' });
   }
 
+  if (!adminAuth) {
+    return res.status(401).json({ error: 'Unauthorized: Firebase Admin Auth credentials not configured on server' });
+  }
+
   const token = authHeader.split('Bearer ')[1];
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);

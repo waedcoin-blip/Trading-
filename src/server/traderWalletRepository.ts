@@ -42,6 +42,19 @@ export class TraderWalletRepository {
   }
 
   public async init(): Promise<void> {
+    if (!adminFirestore) {
+      this.firestoreConnected = false;
+      console.log(`
+Database:
+  Provider: Firebase Firestore
+  Configured: NO
+  Connection: DISABLED
+  Trader wallet persistence: DISABLED
+  Monitoring: RUNNING
+      `.trim());
+      return;
+    }
+
     try {
       // Validate Connection to Firestore per skill guidelines
       await adminFirestore.collection('test').doc('connection').get();
@@ -58,7 +71,7 @@ Database:
       this.syncMonitoringStatusesFromMemory(currentWallets);
     } catch (err: any) {
       this.firestoreConnected = false;
-      console.error('[TraderWalletRepository] Firestore health check failed:', err);
+      console.error('[TraderWalletRepository] Firestore health check failed:', err?.message || err);
       console.log(`
 Database:
   Provider: Firebase Firestore
