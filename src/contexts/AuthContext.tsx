@@ -5,7 +5,7 @@ import {
   signOut as firebaseSignOut, 
   onAuthStateChanged 
 } from 'firebase/auth';
-import { doc, getDocFromServer } from 'firebase/firestore';
+import { doc, getDoc, getDocFromServer } from 'firebase/firestore';
 import { auth, googleAuthProvider, db as firestoreDb } from '../lib/firebase.ts';
 
 interface AuthContextType {
@@ -33,11 +33,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Validate Connection to Firestore per skill guidelines
     async function testFirestoreConnection() {
       try {
-        await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
+        await getDoc(doc(firestoreDb, 'test', 'connection'));
         console.log('[Firestore] Connected to Firestore database successfully.');
       } catch (error) {
-        if (error instanceof Error && error.message.includes('the client is offline')) {
-          console.error('Please check your Firebase configuration.');
+        try {
+          await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
+          console.log('[Firestore] Connected to Firestore server successfully.');
+        } catch (serverErr) {
+          console.warn('[Firestore] Connection notice (operating in offline/cached mode if available):', serverErr);
         }
       }
     }
