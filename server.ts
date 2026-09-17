@@ -1370,11 +1370,23 @@ wss.on('connection', (ws) => {
   console.log('[WS] Client connected');
   clients.add(ws);
 
-  // Send initial data state immediately
-  ws.send(JSON.stringify({
-    type: 'STATE_UPDATE',
-    data: getSanitizedState()
-  }));
+  // Send initial data state immediately.
+  // IMPORTANT: getSanitizedState() is async; sending the Promise directly
+  // serializes it as `{}` and can overwrite the React state, causing a
+  // production white-screen shortly after WebSocket connection.
+  try {
+    const initialState = await getSanitizedState();
+    ws.send(JSON.stringify({
+      type: 'STATE_UPDATE',
+      data: initialState
+    }));
+  } catch (err) {
+    console.error('[WS] Failed to send initial state:', err);
+    ws.send(JSON.stringify({
+      type: 'ERROR',
+      message: 'Failed to initialize application state'
+    }));
+  }
 
   ws.on('message', async (message) => {
     try {
