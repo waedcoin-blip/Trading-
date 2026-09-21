@@ -49,9 +49,11 @@ Database:
   Provider: Firebase Firestore
   Configured: NO
   Connection: DISABLED
-  Trader wallet persistence: DISABLED
+  Trader wallet persistence: LOCAL FALLBACK
   Monitoring: RUNNING
       `.trim());
+      const currentWallets = this.dbFallback.getTraderWallets();
+      this.syncMonitoringStatusesFromMemory(currentWallets);
       return;
     }
 
@@ -77,14 +79,17 @@ Database:
   Provider: Firebase Firestore
   Configured: YES
   Connection: FAILED
-  Trader wallet persistence: DISABLED
+  Trader wallet persistence: LOCAL FALLBACK
   Monitoring: RUNNING
       `.trim());
+      const currentWallets = this.dbFallback.getTraderWallets();
+      this.syncMonitoringStatusesFromMemory(currentWallets);
     }
   }
 
-  public getStorageMode(): 'FIRESTORE' | 'UNAVAILABLE' {
-    return this.firestoreConnected ? 'FIRESTORE' : 'UNAVAILABLE';
+  public getStorageMode(): 'FIRESTORE' | 'LOCAL_FALLBACK' | 'UNAVAILABLE' {
+    if (this.firestoreConnected) return 'FIRESTORE';
+    return this.isProductionEnv ? 'UNAVAILABLE' : 'LOCAL_FALLBACK';
   }
 
   public isProduction(): boolean {
@@ -111,7 +116,10 @@ Database:
    * Retrieves all trader wallets across ALL users (used internally by monitoring engine).
    */
   public async getAllTraderWalletsGlobally(): Promise<TraderWallet[]> {
-    if (!this.firestoreConnected) return [];
+    if (!this.firestoreConnected) {
+      if (this.isProductionEnv) return [];
+      return this.dbFallback.getTraderWallets();
+    }
     
     try {
       const snapshot = await adminFirestore.collectionGroup('trader_wallets').get();
@@ -140,7 +148,10 @@ Database:
    * Retrieves all trader wallets for a specific user.
    */
   public async getTraderWallets(userId: string): Promise<TraderWallet[]> {
-    if (!this.firestoreConnected) return [];
+    if (!this.firestoreConnected) {
+      if (this.isProductionEnv) return [];
+      return this.dbFallback.getTraderWallets();
+    }
 
     try {
       const snapshot = await adminFirestore
@@ -174,7 +185,10 @@ Database:
    * Retrieves a single trader wallet by ID for a specific user.
    */
   public async getTraderWalletById(userId: string, id: string): Promise<TraderWallet | null> {
-    if (!this.firestoreConnected) return null;
+    if (!this.firestoreConnected) {
+      if (this.isProductionEnv) return null;
+      return this.dbFallback.getTraderWallets().find(w => w.id === id) || null;
+    }
 
     try {
       const docRef = adminFirestore.collection('users').doc(userId).collection('trader_wallets').doc(id);
@@ -203,7 +217,34 @@ Database:
    */
   public async addTraderWallet(userId: string, data: { name: string; wallet_address: string; enabled?: boolean }): Promise<TraderWallet> {
     if (!this.firestoreConnected) {
-      throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable. Trader wallets cannot currently be saved. Monitoring remains available.');
+      if (this.isProductionEnv) {
+        throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable. Trader wallets cannot currently be saved. Monitoring remains available.');
+      }
+
+      if (!data.name || !data.name.trim()) {
+        throw new Error('Trader name is required.');
+      }
+
+      const normalizedAddress = (data.wallet_address || '').trim();
+
+      if (!isValidSolanaMint(normalizedAddress)) {
+        throw new Error('Invalid Solana Public Key wallet address.');
+      }
+
+      const existing = this.dbFallback.getTraderWallets();
+      if (existing.some(w => w.wallet_address.toLowerCase() === normalizedAddress.toLowerCase())) {
+        throw new Error(`Trader wallet address ${normalizedAddress} already exists for this user.`);
+      }
+
+      const added = this.dbFallback.addTraderWallet({
+        name: data.name.trim(),
+        wallet_address: normalizedAddress,
+        enabled: data.enabled !== undefined ? Boolean(data.enabled) : true,
+        user_id: userId
+      });
+
+      this.syncSingleMonitoringStatus(added);
+      return added;
     }
 
     if (!data.name || !data.name.trim()) {
@@ -260,7 +301,19 @@ Database:
    */
   public async toggleTraderWallet(userId: string, id: string, enabled?: boolean): Promise<TraderWallet | null> {
     if (!this.firestoreConnected) {
-      throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable.');
+      if (this.isProductionEnv) {
+        throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable.');
+      }
+      const current = this.dbFallback.getTraderWallets().find(w => w.id === id);
+      if (!current) return null;
+      const newEnabled = enabled !== undefined ? Boolean(enabled) : !current.enabled;
+      const updated = this.dbFallback.updateTraderWallet(id, { enabled: newEnabled });
+      if (updated) {
+        this.updateTraderMonitoringStatus(id, {
+          subscriptionStatus: updated.enabled ? 'CONNECTED' : 'IDLE'
+        });
+      }
+      return updated;
     }
 
     const now = new Date().toISOString();
@@ -304,7 +357,14 @@ Database:
    */
   public async deleteTraderWallet(userId: string, id: string): Promise<boolean> {
     if (!this.firestoreConnected) {
-      throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable.');
+      if (this.isProductionEnv) {
+        throw new Error('PERSISTENCE_UNAVAILABLE: Firestore persistence unavailable.');
+      }
+      const deleted = this.dbFallback.deleteTraderWallet(id);
+      if (deleted) {
+        this.monitoringStatuses.delete(id);
+      }
+      return deleted;
     }
 
     try {

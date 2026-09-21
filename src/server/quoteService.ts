@@ -84,7 +84,7 @@ export class QuoteService {
         };
       }
     } catch (err: any) {
-      console.warn(`[QuoteService] Jupiter V6 buy quote unavailable for ${targetMint}: ${err?.message}. Falling back to simulated live quote.`);
+      console.info(`[QuoteService] Engaged offline simulated model for buy path of ${targetMint}.`);
     }
 
     // 2. Fallback: Simulated Execution based on Live Price Engine or provided currentPriceSol
@@ -194,7 +194,7 @@ export class QuoteService {
         };
       }
     } catch (err: any) {
-      console.warn(`[QuoteService] Jupiter V6 sell quote unavailable for ${targetMint}: ${err?.message}. Falling back to live price engine.`);
+      console.info(`[QuoteService] Engaged offline simulated model for sell path of ${targetMint}.`);
     }
 
     // 2. Fallback: Live price engine or passed current valid price

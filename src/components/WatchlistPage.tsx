@@ -46,12 +46,12 @@ export default function WatchlistPage({ state, sendAction }: WatchlistPageProps)
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.success && data.traders) {
-          setTraders(data.traders);
+        if (data.success && (data.wallets || data.traders)) {
+          setTraders(data.wallets || data.traders);
         }
       }
-    } catch (err) {
-      console.error('Failed to fetch trader wallets:', err);
+    } catch (err: any) {
+      console.warn('[Watchlist] Could not sync trader wallets:', err?.message || err);
     }
   };
 

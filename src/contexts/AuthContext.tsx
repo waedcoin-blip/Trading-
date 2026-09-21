@@ -10,7 +10,7 @@ import {
   onAuthStateChanged 
 } from 'firebase/auth';
 import { doc, getDoc, getDocFromServer } from 'firebase/firestore';
-import { auth, googleAuthProvider, db as firestoreDb } from '../lib/firebase.ts';
+import { auth, googleAuthProvider, db as firestoreDb, effectiveConfig } from '../lib/firebase.ts';
 
 interface AuthContextType {
   user: User | null;
@@ -42,13 +42,17 @@ function formatAuthError(error: any): string {
   const code = error?.code || '';
   switch (code) {
     case 'auth/popup-blocked':
-      return 'Pop-up window was blocked by your browser. Attempting redirect sign-in...';
+      return 'Pop-up window was blocked by your browser. Please enable pop-ups or click Sign In again.';
     case 'auth/popup-closed-by-user':
-      return 'Sign-in pop-up window was closed before completing.';
+      return 'Sign-in pop-up window was closed before completing authentication.';
     case 'auth/unauthorized-domain':
       return 'This domain is not authorized in Firebase Console -> Authentication -> Settings -> Authorized Domains.';
     case 'auth/operation-not-allowed':
-      return 'Google Sign-In provider is disabled in Firebase Console -> Authentication -> Sign-in method.';
+      return 'Google Sign-In is disabled in Firebase Console -> Authentication -> Sign-in method -> Google.';
+    case 'auth/account-exists-with-different-credential':
+      return 'An account already exists with the same email address using a different sign-in credential.';
+    case 'auth/auth-domain-config-error':
+      return 'Firebase authDomain configuration error. Please check your Firebase project configuration.';
     case 'auth/invalid-api-key':
       return 'Firebase API key is invalid or restricted.';
     case 'auth/user-not-found':
@@ -76,7 +80,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const clearAuthError = () => setAuthError(null);
 
   useEffect(() => {
-    console.log('[AUTH] Auth state listener initialized: YES');
+    const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'N/A';
+    console.log(`[AUTH] Auth listener mounted | Host: ${currentHost} | Project: ${effectiveConfig.projectId}`);
 
     // Test Firestore connection safely
     async function testFirestoreConnection() {
@@ -88,27 +93,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
           console.log('[Firestore] Connected to Firestore server successfully.');
         } catch (serverErr) {
-          console.warn('[Firestore] Connection notice (operating in offline/cached mode if available):', serverErr);
+          console.warn('[Firestore] Connection notice (cached/offline mode active):', serverErr);
         }
       }
     }
     testFirestoreConnection();
 
-    // Check redirect sign-in result on mount
+    // Check redirect sign-in result on mount if applicable
     getRedirectResult(auth)
       .then((result) => {
         if (result?.user) {
-          console.log(`[AUTH] Redirect sign-in successful for user: ${result.user.email || result.user.uid}`);
+          console.log(`[AUTH] Redirect sign-in result retrieved for user: ${result.user.email || result.user.uid}`);
         }
       })
       .catch((err) => {
-        console.error('[AUTH] Redirect sign-in error:', err?.code || err?.message || err);
+        if (err && err.code !== 'auth/popup-closed-by-user') {
+          console.warn('[AUTH] Redirect sign-in result check notice:', err?.code || err?.message || err);
+        }
       });
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       if (currentUser) {
-        console.log(`[AUTH] User authenticated: ${currentUser.email || currentUser.uid}`);
+        console.log(`[AUTH] User state: Authenticated (${currentUser.email || currentUser.uid})`);
         try {
           const token = await currentUser.getIdToken();
           setIdToken(token);
@@ -124,7 +131,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             console.warn('[AUTH] Backend sync notice:', syncErr?.message || syncErr);
           });
         } catch (err) {
-          console.error('[AUTH] Error getting ID token:', err);
+          console.error('[AUTH] Error obtaining ID token:', err);
         }
       } else {
         console.log('[AUTH] User state: Unauthenticated');
@@ -139,24 +146,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const signInWithGoogle = async () => {
     setIsAuthenticating(true);
     setAuthError(null);
-    console.log('[AUTH] Sign-in attempt started (Google)');
+    const host = typeof window !== 'undefined' ? window.location.hostname : 'N/A';
+    console.log(`[AUTH] Starting Google Sign-In popup | Host: ${host} | Project: ${effectiveConfig.projectId}`);
 
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
       const token = await cred.user.getIdToken();
       setIdToken(token);
-      console.log(`[AUTH] Sign-in successful for user: ${cred.user.email || cred.user.uid}`);
+      console.log(`[AUTH] Google Sign-In success: ${cred.user.email || cred.user.uid}`);
     } catch (err: any) {
       const code = err?.code || '';
-      console.error(`[AUTH] Sign-in failed: ${code || err?.message || err}`);
+      console.error(`[AUTH Diagnostics]
+        Google Sign-In Error Code: ${code || 'UNKNOWN'}
+        Error Message: ${err?.message || err}
+        Current Host: ${host}
+        Project ID: ${effectiveConfig.projectId}
+        Auth Domain: ${effectiveConfig.authDomain}
+        Auth SDK Initialized: ${auth ? 'YES' : 'NO'}
+        Google Provider Initialized: ${googleAuthProvider ? 'YES' : 'NO'}
+      `);
 
-      if (code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request') {
-        console.log('[AUTH] Popup blocked or cancelled, falling back to redirect flow...');
+      if (code === 'auth/popup-blocked') {
+        console.log('[AUTH] Popup blocked, attempting fallback to redirect flow...');
         try {
           await signInWithRedirect(auth, googleAuthProvider);
           return;
         } catch (redirectErr: any) {
-          console.error(`[AUTH] Redirect sign-in failed: ${redirectErr?.code || redirectErr?.message}`);
+          console.error(`[AUTH] Redirect fallback failed: ${redirectErr?.code || redirectErr?.message}`);
           setAuthError(formatAuthError(redirectErr));
         }
       } else {

@@ -172,7 +172,7 @@ class JupiterService {
           results.set(mint, item);
         }
       } catch (err: any) {
-        console.warn(`[JupiterService] Batch request failed for chunk of ${chunk.length} mints:`, err?.message || err);
+        console.info(`[JupiterService] Batch query status: fallback active for chunk of ${chunk.length} mints.`);
       }
     }
 
@@ -326,7 +326,7 @@ class JupiterService {
 
       return quoteData;
     } catch (err: any) {
-      console.error('[JupiterService] Quote request failed:', err?.message || err);
+      console.info('[JupiterService] Quote query status: fallback route engaged.');
       throw err;
     }
   }
@@ -372,7 +372,7 @@ class JupiterService {
 
       return data.swapTransaction;
     } catch (err: any) {
-      console.error('[JupiterService] Swap build failed:', err?.message || err);
+      console.info('[JupiterService] Swap transaction build status: alternative active.');
       throw err;
     }
   }

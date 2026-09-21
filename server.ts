@@ -47,7 +47,7 @@ const appDir = typeof __dirname !== 'undefined' ? __dirname : process.cwd();
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = 3000;
 
 app.use(express.json());
 
@@ -1502,58 +1502,68 @@ wss.on('connection', async (ws) => {
 });
 
 async function startServer() {
-  // Vite dev mode integration or production static serving
-  if (process.env.NODE_ENV === 'production') {
-    const distPath = fs.existsSync(path.join(appDir, 'index.html'))
-      ? appDir
-      : path.join(process.cwd(), 'dist');
+  try {
+    // Vite dev mode integration or production static serving
+    if (process.env.NODE_ENV === 'production') {
+      const distPath = fs.existsSync(path.join(appDir, 'index.html'))
+        ? appDir
+        : path.join(process.cwd(), 'dist');
 
-    console.log(`[Production] Serving static frontend SPA assets from: ${distPath}`);
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  } else {
-    try {
-      const { createServer: createViteServer } = await import('vite');
-      const viteDevServer = await createViteServer({
-        server: { middlewareMode: true },
-        appType: 'spa',
+      console.log(`[Production] Serving static frontend SPA assets from: ${distPath}`);
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
       });
-      app.use(viteDevServer.middlewares);
-    } catch (err) {
-      console.warn('[Vite] Dev middleware initialization warning:', err);
-    }
-  }
-
-  // Start HTTP server on port 3000
-  server.listen(PORT, '0.0.0.0', async () => {
-    console.log(`[Server] Ultra Trading Bot listening on port ${PORT}`);
-    
-    // Initialize persistence repository (Firebase Firestore or local fallback)
-    await TraderWalletRepository.getInstance(db).init();
-    await PaperExecutionService.getInstance(db).syncStateFromFirestore();
-
-    // Initial SOL price sync
-    await updateSolUsdPrice();
-    // Initialize blockchain connection on startup
-    await initSolanaConnection();
-
-    // Initialize & start authoritative 120s Token Discovery Service (Requirement 1, 10, 14)
-    TokenDiscoveryService.getInstance(db).start((feedState) => {
-      // Broadcast WebSocket TOKEN_DISCOVERY_REFRESHED event to all clients
-      const discoveryPayload = JSON.stringify({
-        type: 'TOKEN_DISCOVERY_REFRESHED',
-        data: feedState
-      });
-      for (const client of clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(discoveryPayload);
-        }
+    } else {
+      try {
+        const { createServer: createViteServer } = await import('vite');
+        const viteDevServer = await createViteServer({
+          server: { middlewareMode: true },
+          appType: 'spa',
+        });
+        app.use(viteDevServer.middlewares);
+      } catch (err) {
+        console.warn('[Vite] Dev middleware initialization warning:', err);
       }
-      broadcastState();
+    }
+
+    // Start HTTP server on port 3000
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`[Server] Ultra Trading Bot listening on port ${PORT}`);
+      
+      // Async background startup tasks with error safety
+      (async () => {
+        try {
+          // Initialize persistence repository (Firebase Firestore or local fallback)
+          await TraderWalletRepository.getInstance(db).init();
+          await PaperExecutionService.getInstance(db).syncStateFromFirestore();
+
+          // Initial SOL price sync
+          await updateSolUsdPrice();
+          // Initialize blockchain connection on startup
+          await initSolanaConnection();
+
+          // Initialize & start authoritative 120s Token Discovery Service
+          TokenDiscoveryService.getInstance(db).start((feedState) => {
+            const discoveryPayload = JSON.stringify({
+              type: 'TOKEN_DISCOVERY_REFRESHED',
+              data: feedState
+            });
+            for (const client of clients) {
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(discoveryPayload);
+              }
+            }
+            broadcastState();
+          });
+        } catch (startupErr) {
+          console.error('[Server Startup Initialization Warning]:', startupErr);
+        }
+      })();
     });
-  });
+  } catch (fatalErr) {
+    console.error('[Server Start Critical Error]:', fatalErr);
+  }
 }
 
 startServer();

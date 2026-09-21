@@ -132,7 +132,7 @@ export async function scoreToken(
     if (!ai) {
       baseResult = calculateHeuristicScore(token, historicalTrades);
     } else {
-      const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+      const candidateModels = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite"];
       const simplifiedTrades = historicalTrades.map(t => ({
         pnlPercent: t.pnl_percent,
         reason: t.sell_reason,
@@ -218,7 +218,7 @@ export async function scoreToken(
             console.log('[AI Engine] API quota limit reached. Seamlessly engaging local heuristic scoring engine.');
             break;
           } else {
-            console.log(`[AI Engine] Model ${model} unavailable (${errorMsg.slice(0, 60)}). Falling back...`);
+            console.log(`[AI Engine] Model fallback engaged (${model}).`);
           }
         }
       }

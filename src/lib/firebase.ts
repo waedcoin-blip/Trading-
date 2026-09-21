@@ -3,7 +3,7 @@ import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-const effectiveConfig = {
+export const effectiveConfig = {
   apiKey: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_API_KEY) || firebaseConfig.apiKey,
   authDomain: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_AUTH_DOMAIN) || firebaseConfig.authDomain,
   projectId: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_PROJECT_ID) || firebaseConfig.projectId,
@@ -13,9 +13,15 @@ const effectiveConfig = {
   firestoreDatabaseId: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_DATABASE_ID) || firebaseConfig.firestoreDatabaseId
 };
 
-console.log(`[AUTH] Firebase client initialized: ${effectiveConfig.apiKey ? 'YES' : 'NO'}`);
-console.log(`[AUTH] Firebase project configured: ${effectiveConfig.projectId ? 'YES' : 'NO'}`);
-console.log(`[AUTH] Firebase authDomain: ${effectiveConfig.authDomain || 'NO'}`);
+const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'SSR/Node';
+
+console.log(`[AUTH Diagnostics]
+  Host: ${currentHost}
+  Firebase SDK Apps Existing: ${getApps().length}
+  Project ID: ${effectiveConfig.projectId || 'MISSING'}
+  Auth Domain: ${effectiveConfig.authDomain || 'MISSING'}
+  API Key Configured: ${effectiveConfig.apiKey ? 'YES' : 'NO'}
+`);
 
 const app = getApps().length === 0 ? initializeApp(effectiveConfig) : getApps()[0];
 export const auth = getAuth(app);
